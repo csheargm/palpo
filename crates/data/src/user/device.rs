@@ -424,6 +424,12 @@ pub async fn remove_other_devices(
         })
         .await;
     super::access_token::invalidate_user(user_id);
+    if result.as_ref().is_ok_and(|removed| !removed.is_empty()) {
+        crate::sync_notify::notify_user(user_id);
+        for room_id in joined_rooms {
+            crate::sync_notify::notify_room(room_id);
+        }
+    }
     result
 }
 
@@ -625,6 +631,7 @@ pub async fn add_to_device_event(
                 .await
         })
         .await?;
+    crate::sync_notify::notify_device(target_user_id, target_device_id);
 
     Ok(())
 }

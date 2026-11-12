@@ -258,7 +258,9 @@ async fn with_profile_repair<'a>(
         ensure_profile_exists(user_id).await?;
         updated = attempt().await?;
     }
-    ensure_profile_updated(updated)
+    ensure_profile_updated(updated)?;
+    crate::sync_notify::notify_profile(user_id);
+    Ok(())
 }
 
 pub async fn set_profile_field(user_id: &UserId, field: &str, value: JsonValue) -> DataResult<()> {
@@ -520,6 +522,7 @@ pub async fn delete_global_profile(user_id: &UserId) -> DataResult<()> {
             Ok(())
         })
         .await
+        .inspect(|_| crate::sync_notify::notify_profile(user_id))
 }
 
 /// Profile changes in `[since_sn, until_sn)`, oldest first.

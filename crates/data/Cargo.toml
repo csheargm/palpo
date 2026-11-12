@@ -92,7 +92,7 @@ strum_macros = { workspace = true }
 tempfile = { workspace = true }
 textnonce = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "parking_lot", "process"] }
+tokio = { workspace = true, features = ["macros", "parking_lot", "process", "sync"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true, features = ["io"] }
 tower-service = { workspace = true }

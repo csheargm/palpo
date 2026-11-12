@@ -190,6 +190,10 @@ async fn force_state_inner(
     if !published {
         return Ok(false);
     }
+    for user_id in &users {
+        crate::data::sync_notify::notify_user(user_id);
+    }
+    crate::data::sync_notify::notify_room(room_id);
     if invalidate_space {
         let mut cache = room::space::ROOM_ID_SPACE_CHUNK_CACHE.lock().unwrap();
         cache.remove(&(room_id.to_owned(), false));

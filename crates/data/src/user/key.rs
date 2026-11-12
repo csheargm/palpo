@@ -687,6 +687,10 @@ pub async fn replace_key_change(change: &NewDbKeyChange) -> DataResult<()> {
         .values(change)
         .execute(&mut connect().await?)
         .await?;
+    crate::sync_notify::notify_user(&change.user_id);
+    if let Some(room_id) = &change.room_id {
+        crate::sync_notify::notify_room(room_id);
+    }
     Ok(())
 }
 
@@ -792,6 +796,7 @@ pub async fn apply_remote_device_list_version(
 ) -> DataResult<bool> {
     let stream_id = stream_id.to_string();
     let changed_at = UnixMillis::now();
+    let mut shared_rooms = Vec::new();
     let applied = connect()
         .await?
         .transaction::<_, diesel::result::Error, _>(async |conn| {
@@ -806,6 +811,7 @@ pub async fn apply_remote_device_list_version(
             // Two SELECTs could otherwise combine a departed remote member with
             // a newly joined local member who never shared the room with them.
             let joined_rooms = remote_device_shared_rooms(conn, user_id, local_server).await?;
+            shared_rooms.clone_from(&joined_rooms);
             if joined_rooms.is_empty() {
                 // A verified snapshot was fetched before the first shared
                 // membership is published. Unsolicited EDUs must not erase
@@ -882,5 +888,10 @@ pub async fn apply_remote_device_list_version(
             Ok(true)
         })
         .await?;
+    if applied {
+        for room_id in &shared_rooms {
+            crate::sync_notify::notify_room(room_id);
+        }
+    }
     Ok(applied)
 }

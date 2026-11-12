@@ -52,22 +52,25 @@ pub(super) async fn sync_events_v3(
     let device_id = authed.require_device_id()?;
 
     crate::user::ping_presence(sender_id, &args.set_presence).await?;
+    let default = Duration::from_secs(30);
+    let duration = std::cmp::min(args.timeout.unwrap_or(default), default);
+    // Taken before the response is built, so nothing written meanwhile is missed.
+    let watch = if args.full_state || duration.is_zero() {
+        None
+    } else {
+        Some(crate::watcher::prepare(sender_id, device_id, false).await?)
+    };
     let mut body = crate::sync_v3::sync_events(sender_id, device_id, &args).await?;
 
-    if !args.full_state
+    if let Some(watch) = watch
         && body.rooms.is_empty()
         && body.presence.is_empty()
         && body.account_data.is_empty()
         && body.device_lists.is_empty()
         && body.to_device.is_empty()
     {
-        // Hang a few seconds so requests are not spammed
-        // Stop hanging if new info arrives
-        let default = Duration::from_secs(30);
-        let duration = std::cmp::min(args.timeout.unwrap_or(default), default);
-        // Setup watchers, so if there's no response, we can wait for them
-        let watcher = crate::watcher::watch(sender_id, device_id, false, None);
-        _ = tokio::time::timeout(duration, watcher).await;
+        // Hang until something new arrives or the client's timeout passes.
+        _ = tokio::time::timeout(duration, watch.wait(sender_id, device_id, None)).await;
 
         // Retry returning data
         body = crate::sync_v3::sync_events(sender_id, device_id, &args).await?;

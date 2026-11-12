@@ -50,6 +50,7 @@ pub async fn set_data(
         write_data_locked(conn, existing, user_id, room_id, event_type, json_data).await
     })
     .await
+    .inspect(|_| crate::sync_notify::notify_user(user_id))
 }
 
 /// Replace account data only if its current value is still `expected`.
@@ -81,6 +82,11 @@ pub async fn set_data_if_unchanged(
         Ok(true)
     })
     .await
+    .inspect(|written| {
+        if *written {
+            crate::sync_notify::notify_user(user_id);
+        }
+    })
 }
 
 /// Serialize mutations of one account-data key across server processes.
@@ -292,6 +298,7 @@ pub async fn delete_global_data(user_id: &UserId, kind: &str) -> DataResult<()> 
         delete_data_locked(conn, user_id, None, kind).await
     })
     .await
+    .inspect(|_| crate::sync_notify::notify_user(user_id))
 }
 
 /// Delete a room-scoped account-data entry, keeping a tombstone row so the
@@ -303,6 +310,7 @@ pub async fn delete_room_data(user_id: &UserId, room_id: &RoomId, kind: &str) ->
         delete_data_locked(conn, user_id, Some(room_id), kind).await
     })
     .await
+    .inspect(|_| crate::sync_notify::notify_user(user_id))
 }
 
 async fn delete_data_locked(

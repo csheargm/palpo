@@ -91,6 +91,7 @@ pub async fn set_private_read(
         })
         .execute(&mut connect().await?)
         .await?;
+    crate::sync_notify::notify_user(user_id);
     Ok(())
 }
 
@@ -113,6 +114,7 @@ pub async fn insert_receipt(receipt: &DbReceipt) -> DataResult<()> {
         .values(receipt)
         .execute(&mut connect().await?)
         .await?;
+    crate::sync_notify::notify_room(&receipt.room_id);
     Ok(())
 }
 

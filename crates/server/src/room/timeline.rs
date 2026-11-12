@@ -627,6 +627,14 @@ pub async fn append_pdu(
             Ok(())
         })
         .await?;
+    // Wake long-polling syncs of joined local members; the member event's target
+    // (an invitee, a leaver) may not be among them.
+    crate::data::sync_notify::notify_room(&pdu.room_id);
+    if pdu.event_ty == TimelineEventType::RoomMember
+        && let Some(target) = pdu.state_key.as_deref().and_then(|key| UserId::parse(key).ok())
+    {
+        crate::data::sync_notify::notify_user(&target);
+    }
 
     for prev_id in &pdu.prev_events {
         let new_edge = NewDbEventEdge {

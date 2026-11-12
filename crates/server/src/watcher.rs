@@ -1,3 +1,11 @@
+//! Long-poll wake-up for `/sync`.
+//!
+//! A sync that has nothing to return waits here until something it can see changes.
+//! Writers wake it in-process through [`crate::data::sync_notify`]; the database
+//! snapshot below stays the correctness check, so a signal only ends the sleep and
+//! the snapshot decides whether to answer. A slow fallback recheck covers writers that
+//! do not signal (another server process sharing the database).
+
 use std::time::Duration;
 
 use diesel_async::RunQueryDsl;
@@ -6,15 +14,26 @@ use crate::AppResult;
 use crate::core::Seqnum;
 use crate::core::identifiers::*;
 use crate::data::connect;
+use crate::data::sync_notify::{self, SyncWaiter};
+
+/// Recheck without a signal this often. Upstream polled at this interval for every
+/// wake-up; now it only bounds the delay for writes made by another process.
+const FALLBACK_RECHECK: Duration = Duration::from_secs(3);
 
 #[derive(Debug, diesel::QueryableByName)]
 struct WatchSnapshot {
+    #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Text>)]
+    room_ids: Vec<String>,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     typing_sn: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    receipt_sn: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     inbox_id: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     key_change_id: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    room_key_change_sn: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     membership_id: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -28,12 +47,21 @@ struct WatchSnapshot {
 impl WatchSnapshot {
     fn has_updates_since(&self, previous: &Self) -> bool {
         self.typing_sn > previous.typing_sn
+            || self.receipt_sn > previous.receipt_sn
             || self.inbox_id > previous.inbox_id
             || self.key_change_id > previous.key_change_id
+            || self.room_key_change_sn > previous.room_key_change_sn
             || self.membership_id > previous.membership_id
             || self.event_sn > previous.event_sn
             || self.account_data_sn > previous.account_data_sn
             || self.profile_sn > previous.profile_sn
+    }
+
+    fn joined_rooms(&self) -> Vec<OwnedRoomId> {
+        self.room_ids
+            .iter()
+            .filter_map(|room_id| RoomId::parse(room_id).ok())
+            .collect()
     }
 }
 
@@ -43,7 +71,7 @@ async fn load_watch_snapshot(
     profiles: bool,
 ) -> AppResult<WatchSnapshot> {
     // One statement gives all streams a consistent snapshot instead of issuing
-    // seven sequential round trips for each idle device on every poll.
+    // a round trip per stream.
     diesel::sql_query(
         "WITH joined_rooms AS (
             SELECT room_id FROM (
@@ -52,9 +80,12 @@ async fn load_watch_snapshot(
             ) AS memberships WHERE membership = 'join'
         )
         SELECT
+          ARRAY(SELECT room_id FROM joined_rooms) AS room_ids,
           COALESCE((SELECT MAX(occur_sn) FROM room_typings WHERE room_id IN (SELECT room_id FROM joined_rooms)), 0) AS typing_sn,
+          COALESCE((SELECT MAX(sn) FROM event_receipts WHERE room_id IN (SELECT room_id FROM joined_rooms) AND (ty <> 'm.read.private' OR user_id = $1)), 0) AS receipt_sn,
           COALESCE((SELECT MAX(id) FROM device_inboxes WHERE user_id = $1 AND device_id = $2), 0) AS inbox_id,
           COALESCE((SELECT MAX(id) FROM e2e_key_changes WHERE user_id = $1), 0) AS key_change_id,
+          COALESCE((SELECT MAX(occur_sn) FROM e2e_key_changes WHERE room_id IN (SELECT room_id FROM joined_rooms)), 0) AS room_key_change_sn,
           COALESCE((SELECT MAX(id) FROM room_users WHERE user_id = $1), 0) AS membership_id,
           COALESCE((SELECT MAX(live_published_sn) FROM event_points WHERE live_published_sn IS NOT NULL AND room_id IN (SELECT room_id FROM joined_rooms)), 0) AS event_sn,
           COALESCE((SELECT MAX(occur_sn) FROM user_datas WHERE user_id = $1), 0) AS account_data_sn,
@@ -92,33 +123,131 @@ fn profile_change_is_ready(
     profile_updates && profile_after_sn.is_some_and(|after_sn| latest_change_sn >= after_sn)
 }
 
-pub async fn watch(
+/// A pending long-poll. Take it with [`prepare`] *before* computing the sync
+/// response, so a write that lands while the response is being built is newer than
+/// the baseline and ends the wait, instead of being absorbed into a later baseline.
+pub struct SyncWatch {
+    waiter: SyncWaiter,
+    baseline: WatchSnapshot,
+    profile_updates: bool,
+}
+
+pub async fn prepare(
     user_id: &UserId,
     device_id: &DeviceId,
     profile_updates: bool,
-    profile_after_sn: Option<Seqnum>,
-) -> AppResult<()> {
+) -> AppResult<SyncWatch> {
+    // Register first: any write committed after the baseline read signals us.
+    let waiter = sync_notify::register(user_id, device_id, profile_updates);
     let baseline = load_watch_snapshot(user_id, device_id, profile_updates).await?;
-    if profile_change_is_ready(profile_updates, profile_after_sn, baseline.profile_sn) {
-        return Ok(());
-    }
+    waiter.set_rooms(baseline.joined_rooms());
+    Ok(SyncWatch {
+        waiter,
+        baseline,
+        profile_updates,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+enum Wake {
+    Signal,
+    Recheck,
+    Shutdown,
+}
+
+/// Sleep until a writer signals, the fallback recheck is due, or the server rotates.
+async fn next_wake(
+    waiter: &SyncWaiter,
+    shutdown: std::pin::Pin<&mut impl Future<Output = ()>>,
+    fallback: Duration,
+) -> Wake {
     tokio::select! {
-        _ = crate::ROTATE.watch() => Ok(()),
-        result = async {
-            for _ in 0..10 {
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                if load_watch_snapshot(user_id, device_id, profile_updates).await?.has_updates_since(&baseline) {
-                    return Ok(());
-                }
+        _ = shutdown => Wake::Shutdown,
+        _ = waiter.notified() => Wake::Signal,
+        _ = tokio::time::sleep(fallback) => Wake::Recheck,
+    }
+}
+
+impl SyncWatch {
+    /// Return once anything visible to this device changed since [`prepare`], or on
+    /// shutdown. The caller bounds the wait with the client's timeout.
+    pub async fn wait(
+        self,
+        user_id: &UserId,
+        device_id: &DeviceId,
+        profile_after_sn: Option<Seqnum>,
+    ) -> AppResult<()> {
+        let shutdown = crate::ROTATE.watch();
+        tokio::pin!(shutdown);
+        loop {
+            let current = load_watch_snapshot(user_id, device_id, self.profile_updates).await?;
+            if current.has_updates_since(&self.baseline)
+                || profile_change_is_ready(
+                    self.profile_updates,
+                    profile_after_sn,
+                    current.profile_sn,
+                )
+            {
+                return Ok(());
             }
-            Ok(())
-        } => result,
+            if next_wake(&self.waiter, shutdown.as_mut(), FALLBACK_RECHECK).await == Wake::Shutdown {
+                return Ok(());
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::profile_change_is_ready;
+    use super::*;
+
+    const SHORT: Duration = Duration::from_millis(50);
+
+    fn never() -> impl Future<Output = ()> {
+        std::future::pending()
+    }
+
+    #[tokio::test]
+    async fn a_writer_signal_wakes_the_waiting_sync() {
+        let user: OwnedUserId = "@wake:watcher.test".try_into().unwrap();
+        let waiter = sync_notify::register(&user, "W".into(), false);
+        waiter.set_rooms(vec!["!room:watcher.test".try_into().unwrap()]);
+        let shutdown = never();
+        tokio::pin!(shutdown);
+        let (_, wake) = tokio::join!(
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                sync_notify::notify_room("!room:watcher.test".try_into().unwrap());
+            },
+            next_wake(&waiter, shutdown.as_mut(), Duration::from_secs(30))
+        );
+        assert_eq!(wake, Wake::Signal);
+    }
+
+    #[tokio::test]
+    async fn without_a_signal_the_wait_ends_only_at_the_fallback_recheck() {
+        let user: OwnedUserId = "@idle:watcher.test".try_into().unwrap();
+        let waiter = sync_notify::register(&user, "I".into(), false);
+        let shutdown = never();
+        tokio::pin!(shutdown);
+        let started = std::time::Instant::now();
+        assert_eq!(next_wake(&waiter, shutdown.as_mut(), SHORT).await, Wake::Recheck);
+        assert!(started.elapsed() >= SHORT);
+    }
+
+    #[tokio::test]
+    async fn server_rotation_ends_the_wait() {
+        let user: OwnedUserId = "@rotate:watcher.test".try_into().unwrap();
+        let waiter = sync_notify::register(&user, "R".into(), false);
+        let rotation = crate::RotationHandler::new();
+        let shutdown = rotation.watch();
+        tokio::pin!(shutdown);
+        rotation.fire();
+        assert_eq!(
+            next_wake(&waiter, shutdown.as_mut(), Duration::from_secs(30)).await,
+            Wake::Shutdown
+        );
+    }
 
     #[test]
     fn profile_changes_at_or_after_the_response_token_are_already_ready() {
@@ -144,10 +273,14 @@ mod database_tests {
             .execute(&mut connect().await.unwrap()).await.unwrap();
         let mut previous = load_watch_snapshot(&user, device, true).await.unwrap();
         assert!(!previous.has_updates_since(&previous));
+        assert_eq!(previous.joined_rooms(), vec![OwnedRoomId::try_from("!watch:example.org").unwrap()]);
         // A different device's inbox and an unrelated profile are irrelevant.
         diesel::sql_query("INSERT INTO device_inboxes(user_id,device_id,json_data,created_at) VALUES ('@watch:example.org','OTHER','{}',0)")
             .execute(&mut connect().await.unwrap()).await.unwrap();
         diesel::sql_query("INSERT INTO user_profile_changes(occur_sn,user_id,field,value,removed) VALUES (900,'@stranger:example.org','displayname','\"unrelated\"',false)")
+            .execute(&mut connect().await.unwrap()).await.unwrap();
+        // A peer's private read receipt is not visible to this user.
+        diesel::sql_query("INSERT INTO event_receipts(sn,ty,room_id,user_id,event_id,event_sn,json_data,receipt_at) VALUES (901,'m.read.private','!watch:example.org','@peer:example.org','$watch-member',1,'{}',0)")
             .execute(&mut connect().await.unwrap()).await.unwrap();
         assert!(
             !load_watch_snapshot(&user, device, true)
@@ -158,6 +291,8 @@ mod database_tests {
         for sql in [
             "INSERT INTO device_inboxes(user_id,device_id,json_data,created_at) VALUES ('@watch:example.org','WATCH','{}',0)",
             "INSERT INTO room_typings(room_id,user_id,timeout_at,occur_sn) VALUES ('!watch:example.org','@peer:example.org',999999,20)",
+            "INSERT INTO event_receipts(sn,ty,room_id,user_id,event_id,event_sn,json_data,receipt_at) VALUES (25,'m.read','!watch:example.org','@peer:example.org','$watch-member',1,'{}',0)",
+            "INSERT INTO e2e_key_changes(user_id,room_id,occur_sn,changed_at) VALUES ('@peer:example.org','!watch:example.org',35,0)",
             "INSERT INTO e2e_key_changes(user_id,occur_sn,changed_at) VALUES ('@watch:example.org',30,0)",
             "INSERT INTO event_points(event_id,event_sn,room_id,frame_id,live_published_sn,live_published_frame_id) VALUES ('$watch-event',40,'!watch:example.org',1,40,1)",
             "INSERT INTO user_datas(user_id,data_type,json_data,is_deleted,occur_sn,created_at) VALUES ('@watch:example.org','m.push_rules','{}',false,50,0)",

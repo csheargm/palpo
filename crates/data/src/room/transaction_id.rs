@@ -203,6 +203,13 @@ pub async fn commit_to_device_transaction(
             Ok(true)
         })
         .await
+        .inspect(|committed| {
+            if *committed {
+                for inbox in inboxes {
+                    crate::sync_notify::notify_device(&inbox.user_id, &inbox.device_id);
+                }
+            }
+        })
 }
 
 /// Recover a published local event after a crash between timeline publication

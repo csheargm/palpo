@@ -73,23 +73,31 @@ pub(super) async fn sync_events_v5(
         )
         .await;
 
+    #[cfg(feature = "unstable-msc4262")]
+    let profile_updates = req_body.extensions.profiles.enabled.unwrap_or(false);
+    #[cfg(not(feature = "unstable-msc4262"))]
+    let profile_updates = false;
+    let duration = long_poll_timeout(args.timeout);
+    // Taken before the response is built, so nothing written meanwhile is missed.
+    let watch = if duration.is_zero() {
+        None
+    } else {
+        Some(crate::watcher::prepare(sender_id, device_id, profile_updates).await?)
+    };
     let mut res_body =
         crate::sync_v5::sync_events(sender_id, device_id, since.clone(), &req_body, &known_rooms)
             .await?;
 
     let since_is_ahead = since_sn > data::curr_sn().await?;
-    if should_long_poll(
-        since_is_ahead,
-        args.pos.is_some(),
-        &res_body,
-        &previous_list_counts,
-        &previous_list_windows,
-    ) {
-        let duration = long_poll_timeout(args.timeout);
-        #[cfg(feature = "unstable-msc4262")]
-        let profile_updates = req_body.extensions.profiles.enabled.unwrap_or(false);
-        #[cfg(not(feature = "unstable-msc4262"))]
-        let profile_updates = false;
+    if let Some(watch) = watch
+        && should_long_poll(
+            since_is_ahead,
+            args.pos.is_some(),
+            &res_body,
+            &previous_list_counts,
+            &previous_list_windows,
+        )
+    {
         #[cfg(feature = "unstable-msc4262")]
         let profile_after_sn = res_body
             .pos
@@ -98,8 +106,7 @@ pub(super) async fn sync_events_v5(
             .map(|pos| pos.event_sn);
         #[cfg(not(feature = "unstable-msc4262"))]
         let profile_after_sn = None;
-        let watcher =
-            crate::watcher::watch(sender_id, device_id, profile_updates, profile_after_sn);
+        let watcher = watch.wait(sender_id, device_id, profile_after_sn);
         _ = tokio::time::timeout(duration, watcher).await;
         res_body =
             crate::sync_v5::sync_events(sender_id, device_id, since, &req_body, &known_rooms)

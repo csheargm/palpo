@@ -125,6 +125,7 @@ pub async fn update_membership(
                 replace_membership_with_conn(conn, &row).await
             })
             .await?;
+        crate::data::sync_notify::notify_user(user_id);
         finish_membership_update(room_id).await?;
     }
     Ok(())

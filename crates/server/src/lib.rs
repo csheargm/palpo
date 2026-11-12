@@ -798,6 +798,8 @@ impl MatrixServer {
             }
         });
 
+        crate::room::typing::start_expiry_sweeper();
+
         // MSC4354: reclaim the sticky-event index once events fall out of their sticky
         // window. Delivery already filters on the expiry, so this only frees space.
         tokio::spawn(async move {

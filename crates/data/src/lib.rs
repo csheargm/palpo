@@ -24,6 +24,7 @@ pub mod misc;
 pub mod room;
 pub mod schema;
 pub mod sending;
+pub mod sync_notify;
 pub mod user;
 
 mod error;
