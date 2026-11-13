@@ -82,7 +82,18 @@ pub(super) async fn sync_events_v5(
     let watch = if duration.is_zero() {
         None
     } else {
-        Some(crate::watcher::prepare(sender_id, device_id, profile_updates).await?)
+        Some(
+            crate::watcher::prepare(
+                sender_id,
+                device_id,
+                // Sliding sync here carries no presence extension.
+                crate::watcher::WatchStreams {
+                    profiles: profile_updates,
+                    presence: false,
+                },
+            )
+            .await?,
+        )
     };
     let mut res_body =
         crate::sync_v5::sync_events(sender_id, device_id, since.clone(), &req_body, &known_rooms)
@@ -107,7 +118,7 @@ pub(super) async fn sync_events_v5(
         #[cfg(not(feature = "unstable-msc4262"))]
         let profile_after_sn = None;
         let watcher = watch.wait(sender_id, device_id, profile_after_sn);
-        _ = tokio::time::timeout(duration, watcher).await;
+        crate::watcher::wait_bounded(duration, watcher).await?;
         res_body =
             crate::sync_v5::sync_events(sender_id, device_id, since, &req_body, &known_rooms)
                 .await?;

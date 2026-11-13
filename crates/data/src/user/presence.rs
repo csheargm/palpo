@@ -193,8 +193,30 @@ pub async fn restamp_presence_with_conn(
     )
 }
 
+/// Wake the waiting syncs of users who share a joined room with `user_id`: they
+/// receive its presence. Call after the presence write has committed.
+// TODO(split): this file is over budget; move publication (set/refresh/notify) to
+// `presence/publish.rs`.
+async fn notify_presence_watchers(user_id: &UserId) {
+    match crate::user::joined_rooms(user_id).await {
+        Ok(rooms) => rooms.iter().for_each(|room| crate::sync_notify::notify_room(room)),
+        // The write is already committed, so failing the caller would misreport it;
+        // waiting syncs still see the change at their fallback recheck.
+        Err(error) => tracing::warn!(%user_id, ?error, "presence sync wake-up skipped"),
+    }
+}
+
 /// Atomically replace presence and publish its new stream position.
-pub async fn set_presence(mut db_presence: NewDbPresence, force: bool) -> DataResult<bool> {
+pub async fn set_presence(db_presence: NewDbPresence, force: bool) -> DataResult<bool> {
+    let user_id = db_presence.user_id.clone();
+    let changed = write_presence(db_presence, force).await?;
+    if changed {
+        notify_presence_watchers(&user_id).await;
+    }
+    Ok(changed)
+}
+
+async fn write_presence(mut db_presence: NewDbPresence, force: bool) -> DataResult<bool> {
     connect()
         .await?
         .transaction::<_, crate::DataError, _>(async |conn| {
@@ -265,7 +287,9 @@ pub async fn refresh_presence_for_profile(user_id: &UserId) -> DataResult<()> {
                 .await?;
             Ok(())
         })
-        .await
+        .await?;
+    notify_presence_watchers(user_id).await;
+    Ok(())
 }
 
 /// Removes the presence record for the given user from the database.

@@ -126,6 +126,10 @@ mod database_tests {
 
     use super::*;
 
+    // Not skipped in CI: .github/workflows/quality-control.yml "PostgreSQL
+    // regression tests" creates an empty palpo_test database and runs every
+    // `database_` test with `-- --ignored`. Locally: PALPO_TEST_DATABASE_URL=<empty db>
+    // cargo test -p palpo --all-features database_ -- --ignored --test-threads=1
     #[tokio::test]
     #[ignore = "requires an empty dedicated PALPO_TEST_DATABASE_URL"]
     async fn database_typing_expiry_bumps_the_sequence_once_and_wakes_sync() {

@@ -58,7 +58,17 @@ pub(super) async fn sync_events_v3(
     let watch = if args.full_state || duration.is_zero() {
         None
     } else {
-        Some(crate::watcher::prepare(sender_id, device_id, false).await?)
+        Some(
+            crate::watcher::prepare(
+                sender_id,
+                device_id,
+                crate::watcher::WatchStreams {
+                    profiles: false,
+                    presence: crate::config::get().presence.allow_local,
+                },
+            )
+            .await?,
+        )
     };
     let mut body = crate::sync_v3::sync_events(sender_id, device_id, &args).await?;
 
@@ -70,7 +80,7 @@ pub(super) async fn sync_events_v3(
         && body.to_device.is_empty()
     {
         // Hang until something new arrives or the client's timeout passes.
-        _ = tokio::time::timeout(duration, watch.wait(sender_id, device_id, None)).await;
+        crate::watcher::wait_bounded(duration, watch.wait(sender_id, device_id, None)).await?;
 
         // Retry returning data
         body = crate::sync_v3::sync_events(sender_id, device_id, &args).await?;

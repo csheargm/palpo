@@ -5,6 +5,9 @@
 //! snapshot below stays the correctness check, so a signal only ends the sleep and
 //! the snapshot decides whether to answer. A slow fallback recheck covers writers that
 //! do not signal (another server process sharing the database).
+//!
+//! TODO(split): move `WatchSnapshot`, its SQL and `database_tests` into
+//! `watcher/snapshot.rs`, leaving waiter orchestration here (file is over budget).
 
 use std::time::Duration;
 
@@ -42,6 +45,8 @@ struct WatchSnapshot {
     account_data_sn: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     profile_sn: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    presence_sn: i64,
 }
 
 impl WatchSnapshot {
@@ -55,6 +60,7 @@ impl WatchSnapshot {
             || self.event_sn > previous.event_sn
             || self.account_data_sn > previous.account_data_sn
             || self.profile_sn > previous.profile_sn
+            || self.presence_sn > previous.presence_sn
     }
 
     fn joined_rooms(&self) -> Vec<OwnedRoomId> {
@@ -65,10 +71,19 @@ impl WatchSnapshot {
     }
 }
 
+/// Which optional streams a waiting sync delivers, so it is woken only by them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WatchStreams {
+    /// MSC4262 profile updates (sliding sync).
+    pub profiles: bool,
+    /// Presence of users sharing a joined room (v3 sync with local presence on).
+    pub presence: bool,
+}
+
 async fn load_watch_snapshot(
     user_id: &UserId,
     device_id: &DeviceId,
-    profiles: bool,
+    streams: WatchStreams,
 ) -> AppResult<WatchSnapshot> {
     // One statement gives all streams a consistent snapshot instead of issuing
     // a round trip per stream.
@@ -78,6 +93,13 @@ async fn load_watch_snapshot(
                 SELECT DISTINCT ON (room_id) room_id, membership FROM room_users
                 WHERE user_id = $1 ORDER BY room_id, id DESC
             ) AS memberships WHERE membership = 'join'
+        ),
+        shared_members AS (
+            SELECT user_id FROM (
+                SELECT DISTINCT ON (user_id, room_id) user_id, room_id, membership
+                FROM room_users WHERE room_id IN (SELECT room_id FROM joined_rooms)
+                ORDER BY user_id, room_id, id DESC
+            ) AS members WHERE membership = 'join'
         )
         SELECT
           ARRAY(SELECT room_id FROM joined_rooms) AS room_ids,
@@ -90,18 +112,18 @@ async fn load_watch_snapshot(
           COALESCE((SELECT MAX(live_published_sn) FROM event_points WHERE live_published_sn IS NOT NULL AND room_id IN (SELECT room_id FROM joined_rooms)), 0) AS event_sn,
           COALESCE((SELECT MAX(occur_sn) FROM user_datas WHERE user_id = $1), 0) AS account_data_sn,
           CASE WHEN $3 THEN COALESCE((
-            SELECT MAX(occur_sn) FROM user_profile_changes WHERE user_id = $1 OR user_id IN (
-                SELECT user_id FROM (
-                    SELECT DISTINCT ON (user_id, room_id) user_id, room_id, membership
-                    FROM room_users WHERE room_id IN (SELECT room_id FROM joined_rooms)
-                    ORDER BY user_id, room_id, id DESC
-                ) AS shared_members WHERE membership = 'join'
-            )
-          ), 0) ELSE 0 END AS profile_sn",
+            SELECT MAX(occur_sn) FROM user_profile_changes
+            WHERE user_id = $1 OR user_id IN (SELECT user_id FROM shared_members)
+          ), 0) ELSE 0 END AS profile_sn,
+          CASE WHEN $4 THEN COALESCE((
+            SELECT MAX(occur_sn) FROM user_presences
+            WHERE user_id <> $1 AND user_id IN (SELECT user_id FROM shared_members)
+          ), 0) ELSE 0 END AS presence_sn",
     )
     .bind::<diesel::sql_types::Text, _>(user_id.as_str())
     .bind::<diesel::sql_types::Text, _>(device_id.as_str())
-    .bind::<diesel::sql_types::Bool, _>(profiles)
+    .bind::<diesel::sql_types::Bool, _>(streams.profiles)
+    .bind::<diesel::sql_types::Bool, _>(streams.presence)
     .get_result(&mut connect().await?).await.map_err(Into::into)
 }
 
@@ -110,7 +132,7 @@ pub(crate) async fn live_position_for_test(
     user_id: &UserId,
     device_id: &DeviceId,
 ) -> AppResult<i64> {
-    Ok(load_watch_snapshot(user_id, device_id, false)
+    Ok(load_watch_snapshot(user_id, device_id, WatchStreams::default())
         .await?
         .event_sn)
 }
@@ -129,23 +151,36 @@ fn profile_change_is_ready(
 pub struct SyncWatch {
     waiter: SyncWaiter,
     baseline: WatchSnapshot,
-    profile_updates: bool,
+    streams: WatchStreams,
 }
 
 pub async fn prepare(
     user_id: &UserId,
     device_id: &DeviceId,
-    profile_updates: bool,
+    streams: WatchStreams,
 ) -> AppResult<SyncWatch> {
     // Register first: any write committed after the baseline read signals us.
-    let waiter = sync_notify::register(user_id, device_id, profile_updates);
-    let baseline = load_watch_snapshot(user_id, device_id, profile_updates).await?;
+    let waiter = sync_notify::register(user_id, device_id, streams.profiles);
+    let baseline = load_watch_snapshot(user_id, device_id, streams).await?;
     waiter.set_rooms(baseline.joined_rooms());
     Ok(SyncWatch {
         waiter,
         baseline,
-        profile_updates,
+        streams,
     })
+}
+
+/// Wait for `watch` at most `duration`. Reaching the client's timeout is the normal
+/// end of an idle long-poll; a watcher failure (its snapshot query) is returned, not
+/// mistaken for a wake-up that would answer with an empty response.
+pub async fn wait_bounded(
+    duration: Duration,
+    watch: impl Future<Output = AppResult<()>>,
+) -> AppResult<()> {
+    match tokio::time::timeout(duration, watch).await {
+        Ok(result) => result,
+        Err(_elapsed) => Ok(()),
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -180,10 +215,10 @@ impl SyncWatch {
         let shutdown = crate::ROTATE.watch();
         tokio::pin!(shutdown);
         loop {
-            let current = load_watch_snapshot(user_id, device_id, self.profile_updates).await?;
+            let current = load_watch_snapshot(user_id, device_id, self.streams).await?;
             if current.has_updates_since(&self.baseline)
                 || profile_change_is_ready(
-                    self.profile_updates,
+                    self.streams.profiles,
                     profile_after_sn,
                     current.profile_sn,
                 )
@@ -249,6 +284,18 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_idle_wait_ends_quietly_at_the_client_timeout() {
+        let idle = std::future::pending::<AppResult<()>>();
+        assert!(wait_bounded(SHORT, idle).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_watcher_failure_is_returned_not_treated_as_a_wakeup() {
+        let failing = async { Err(crate::AppError::public("snapshot query failed")) };
+        assert!(wait_bounded(Duration::from_secs(30), failing).await.is_err());
+    }
+
     #[test]
     fn profile_changes_at_or_after_the_response_token_are_already_ready() {
         assert!(profile_change_is_ready(true, Some(10), 10));
@@ -263,6 +310,11 @@ mod tests {
 mod database_tests {
     use super::*;
 
+    const ALL: WatchStreams = WatchStreams {
+        profiles: true,
+        presence: true,
+    };
+
     #[tokio::test]
     #[ignore = "requires an empty dedicated PALPO_TEST_DATABASE_URL"]
     async fn database_watch_snapshot_covers_streams_without_unrelated_wakeups() {
@@ -271,7 +323,7 @@ mod database_tests {
         let device: &DeviceId = "WATCH".into();
         diesel::sql_query("INSERT INTO room_users (event_id,event_sn,room_id,user_id,user_server_id,sender_id,membership,created_at) VALUES ('$watch-member',1,'!watch:example.org','@watch:example.org','example.org','@watch:example.org','join',0),('$watch-peer',2,'!watch:example.org','@peer:example.org','example.org','@peer:example.org','join',0)")
             .execute(&mut connect().await.unwrap()).await.unwrap();
-        let mut previous = load_watch_snapshot(&user, device, true).await.unwrap();
+        let mut previous = load_watch_snapshot(&user, device, ALL).await.unwrap();
         assert!(!previous.has_updates_since(&previous));
         assert_eq!(previous.joined_rooms(), vec![OwnedRoomId::try_from("!watch:example.org").unwrap()]);
         // A different device's inbox and an unrelated profile are irrelevant.
@@ -279,11 +331,14 @@ mod database_tests {
             .execute(&mut connect().await.unwrap()).await.unwrap();
         diesel::sql_query("INSERT INTO user_profile_changes(occur_sn,user_id,field,value,removed) VALUES (900,'@stranger:example.org','displayname','\"unrelated\"',false)")
             .execute(&mut connect().await.unwrap()).await.unwrap();
+        // Own presence is not delivered to oneself; a stranger's is not visible.
+        diesel::sql_query("INSERT INTO user_presences(user_id,state,occur_sn,updated_at) VALUES ('@watch:example.org','online',902,0),('@stranger:example.org','online',903,0)")
+            .execute(&mut connect().await.unwrap()).await.unwrap();
         // A peer's private read receipt is not visible to this user.
         diesel::sql_query("INSERT INTO event_receipts(sn,ty,room_id,user_id,event_id,event_sn,json_data,receipt_at) VALUES (901,'m.read.private','!watch:example.org','@peer:example.org','$watch-member',1,'{}',0)")
             .execute(&mut connect().await.unwrap()).await.unwrap();
         assert!(
-            !load_watch_snapshot(&user, device, true)
+            !load_watch_snapshot(&user, device, ALL)
                 .await
                 .unwrap()
                 .has_updates_since(&previous)
@@ -298,13 +353,14 @@ mod database_tests {
             "INSERT INTO user_datas(user_id,data_type,json_data,is_deleted,occur_sn,created_at) VALUES ('@watch:example.org','m.push_rules','{}',false,50,0)",
             "INSERT INTO user_profile_changes(occur_sn,user_id,field,value,removed) VALUES (60,'@watch:example.org','displayname','\"self\"',false)",
             "INSERT INTO user_profile_changes(occur_sn,user_id,field,value,removed) VALUES (70,'@peer:example.org','displayname','\"shared\"',false)",
+            "INSERT INTO user_presences(user_id,state,occur_sn,updated_at) VALUES ('@peer:example.org','online',75,0)",
             "INSERT INTO room_users(event_id,event_sn,room_id,user_id,user_server_id,sender_id,membership,created_at) VALUES ('$watch-new',80,'!new:example.org','@watch:example.org','example.org','@watch:example.org','join',0)",
         ] {
             diesel::sql_query(sql)
                 .execute(&mut connect().await.unwrap())
                 .await
                 .unwrap();
-            let current = load_watch_snapshot(&user, device, true).await.unwrap();
+            let current = load_watch_snapshot(&user, device, ALL).await.unwrap();
             assert!(
                 current.has_updates_since(&previous),
                 "did not observe {sql}"
@@ -312,8 +368,9 @@ mod database_tests {
             previous = current;
         }
         assert_eq!(previous.profile_sn, 70);
+        assert_eq!(previous.presence_sn, 75);
         assert_eq!(
-            load_watch_snapshot(&user, device, false)
+            load_watch_snapshot(&user, device, WatchStreams::default())
                 .await
                 .unwrap()
                 .profile_sn,
@@ -323,10 +380,40 @@ mod database_tests {
         diesel::sql_query("INSERT INTO event_points(event_id,event_sn,room_id,frame_id,live_published_sn,live_published_frame_id) VALUES ('$watch-outside',1000,'!outside:example.org',1,1000,1),('$watch-outlier',1001,'!watch:example.org',NULL,NULL,NULL),('$watch-cached',1002,'!watch:example.org',1,NULL,NULL)")
             .execute(&mut connect().await.unwrap()).await.unwrap();
         assert!(
-            !load_watch_snapshot(&user, device, true)
+            !load_watch_snapshot(&user, device, ALL)
                 .await
                 .unwrap()
                 .has_updates_since(&previous)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an empty dedicated PALPO_TEST_DATABASE_URL"]
+    async fn database_presence_only_update_wakes_a_room_peer_sync() {
+        crate::test_database::init();
+        diesel::sql_query("INSERT INTO room_users (event_id,event_sn,room_id,user_id,user_server_id,sender_id,membership,created_at) VALUES ('$presence-peer',5001,'!presence:example.org','@presence-peer:example.org','example.org','@presence-peer:example.org','join',0)")
+            .execute(&mut connect().await.unwrap()).await.unwrap();
+        let watcher: OwnedUserId = "@presence-watch:example.org".try_into().unwrap();
+        let waiter = sync_notify::register(&watcher, "P".into(), false);
+        waiter.set_rooms(vec!["!presence:example.org".try_into().unwrap()]);
+        let presence = crate::data::user::NewDbPresence {
+            user_id: "@presence-peer:example.org".try_into().unwrap(),
+            stream_id: None,
+            state: Some("online".to_owned()),
+            status_msg: None,
+            last_active_at: None,
+            last_federation_update_at: None,
+            last_user_sync_at: None,
+            currently_active: Some(true),
+            occur_sn: None,
+            updated_at: crate::core::UnixMillis::now(),
+        };
+        assert!(crate::data::user::set_presence(presence, false).await.unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), waiter.notified())
+                .await
+                .is_ok(),
+            "a presence-only change did not wake the peer's waiting sync"
         );
     }
 }
