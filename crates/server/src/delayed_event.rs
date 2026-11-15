@@ -329,8 +329,20 @@ async fn send_delayed_pdu(
     if event_type == TimelineEventType::RoomEncrypted && !config::get().allow_encryption {
         return Err(MatrixError::forbidden("Encryption has been disabled", None).into());
     }
+    // Membership may have changed since scheduling, so normalize again under the
+    // room lock, exactly as an immediate state send does, before both the state
+    // checks and PDU construction see the content.
+    let mut event = event.clone();
     if let Some(state_key) = &event.state_key {
         let state_event_type: StateEventType = event.event_type.clone().into();
+        if state_event_type == StateEventType::RoomMember {
+            crate::state::strip_redundant_join_authoriser(
+                &event.room_id,
+                state_key,
+                &mut event.content,
+            )
+            .await;
+        }
         crate::state::allowed_to_send_state_event(
             &event.room_id,
             &state_event_type,
@@ -341,7 +353,7 @@ async fn send_delayed_pdu(
     }
 
     let event_id = timeline::build_and_append_pdu_force_locked(
-        delayed_pdu_builder(event)?,
+        delayed_pdu_builder(&event)?,
         &event.user_id,
         &event.room_id,
         &crate::room::get_version(&event.room_id).await?,
@@ -375,7 +387,7 @@ pub async fn schedule(
     sticky_duration_ms: Option<crate::core::events::sticky::StickyDurationMs>,
     delay: Duration,
     state_key: Option<String>,
-    content: JsonValue,
+    mut content: JsonValue,
 ) -> AppResult<String> {
     let conf = config::get();
     let now = UnixMillis::now().get() as i64;
@@ -437,6 +449,10 @@ pub async fn schedule(
     }
     if let Some(state_key) = &state_key {
         let state_event_type: StateEventType = event_type.to_string().into();
+        if state_event_type == StateEventType::RoomMember {
+            // Schedule-time view only; fire time normalizes again under the lock.
+            crate::state::strip_redundant_join_authoriser(room_id, state_key, &mut content).await;
+        }
         crate::state::allowed_to_send_state_event(
             room_id,
             &state_event_type,

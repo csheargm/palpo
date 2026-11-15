@@ -86,6 +86,7 @@ async fn update_delayed_event(
 /// schedules the event through the same machinery, limits and `[delayed_events]`
 /// switch as `send_delayed_event`, instead of sending it at once.
 /// `txn_id` is `None` for state, whose route has no transaction ID; a fresh one is used.
+/// A `/send` txn_id is stored scoped (see [`scoped_send_txn_id`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn schedule_from_query(
     authed: &crate::AuthedInfo,
@@ -98,14 +99,17 @@ pub(crate) async fn schedule_from_query(
     state_key: Option<String>,
     content: serde_json::Value,
 ) -> AppResult<String> {
-    let fresh = crate::core::TransactionId::new();
+    let txn_id = match txn_id {
+        Some(txn_id) => scoped_send_txn_id(room_id, &event_type, txn_id),
+        None => crate::core::TransactionId::new(),
+    };
     crate::delayed_event::schedule(
         authed.user_id(),
         authed.device_id(),
         authed.appservice().is_some(),
         room_id,
         &event_type,
-        txn_id.unwrap_or(&fresh),
+        &txn_id,
         timestamp,
         sticky_duration_ms,
         std::time::Duration::from_millis(delay_ms),
@@ -113,6 +117,35 @@ pub(crate) async fn schedule_from_query(
         content,
     )
     .await
+}
+
+/// Idempotency key stored for a delayed `/send/{event_type}/{txn_id}`.
+///
+/// Immediate `/send` transactions are scoped by (user, device, room, endpoint);
+/// the `delayed_events` unique index is (user, device, txn_id). Encoding room and
+/// event type into the stored txn_id gives the delayed form the same scope under
+/// that index without a schema change, and the `msc4140/send` tag keeps it apart
+/// from txn_ids of the unstable `/delayed_event/{type}/{txn_id}` endpoint, which
+/// are stored raw. A JSON array keeps the encoding unambiguous for any txn_id.
+pub(crate) fn scoped_send_txn_id(
+    room_id: &crate::core::RoomId,
+    event_type: &crate::core::events::TimelineEventType,
+    txn_id: &crate::core::TransactionId,
+) -> crate::core::OwnedTransactionId {
+    serde_json::json!(["msc4140/send", room_id, event_type.to_string(), txn_id])
+        .to_string()
+        .into()
+}
+
+/// The error for a `/send` txn_id already used in the other mode (with vs without
+/// `org.matrix.msc4140.delay`). Neither stored outcome can answer the retry as
+/// asked, and silently creating a second event would break idempotency.
+pub(crate) fn txn_mode_conflict() -> crate::AppError {
+    crate::MatrixError::invalid_param(
+        "this transaction ID was already used for this room and event type \
+         with a different org.matrix.msc4140.delay mode",
+    )
+    .into()
 }
 
 /// Retain the historical query form while rejecting ambiguous requests.

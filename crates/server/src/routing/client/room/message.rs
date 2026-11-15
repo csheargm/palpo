@@ -4,6 +4,7 @@ use diesel::prelude::*;
 use horme::RunQueryDsl;
 use serde_json::value::to_raw_value;
 
+use super::super::delayed_event as delayed;
 use crate::core::client::delayed_events::SentOrDelayedResBody;
 use crate::core::client::message::{
     CreateMessageReqArgs, CreateMessageWithTxnReqArgs, MessagesReqArgs, MessagesResBody,
@@ -319,8 +320,29 @@ pub(super) async fn send_message(
 
     let payload = req.payload().await?;
     let content = parse_event_content(payload)?;
+    let endpoint = format!("room/send/{}", args.event_type);
+    let delayed_txn_id = delayed::scoped_send_txn_id(
+        &args.room_id,
+        &args.event_type.to_string().into(),
+        &args.txn_id,
+    );
+    // Both modes check the other mode's record under the room lock, so a txn_id
+    // cannot be committed once as delayed and once as immediate.
+    let state_lock = room::lock_state(&args.room_id).await;
     if let Some(delay_ms) = args.delay_ms {
-        let delay_id = super::super::delayed_event::schedule_from_query(
+        if crate::data::room::transaction_id::get_scoped_event_id(
+            &args.txn_id,
+            authed.user_id(),
+            authed.device_id(),
+            Some(&args.room_id),
+            &endpoint,
+        )
+        .await?
+        .is_some()
+        {
+            return Err(delayed::txn_mode_conflict());
+        }
+        let delay_id = delayed::schedule_from_query(
             authed,
             &args.room_id,
             args.event_type.to_string().into(),
@@ -334,10 +356,18 @@ pub(super) async fn send_message(
         .await?;
         return json_ok(SentOrDelayedResBody::Delayed { delay_id });
     }
+    if crate::data::room::delayed_event::get_by_txn_id(
+        authed.user_id(),
+        authed.device_id(),
+        &delayed_txn_id,
+    )
+    .await?
+    .is_some()
+    {
+        return Err(delayed::txn_mode_conflict());
+    }
 
-    let state_lock = room::lock_state(&args.room_id).await;
     // Check if this is a new transaction id
-    let endpoint = format!("room/send/{}", args.event_type);
     if let Some(event_id) = crate::data::room::transaction_id::get_scoped_event_id(
         &args.txn_id,
         authed.user_id(),

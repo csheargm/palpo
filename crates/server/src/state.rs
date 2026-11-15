@@ -28,23 +28,7 @@ pub async fn send_state_event_for_key(
     let state_lock = room::lock_state(room_id).await;
     if *event_type == StateEventType::RoomMember {
         let mut content: serde_json::Value = serde_json::from_str(json.inner().get())?;
-        if content
-            .get("membership")
-            .and_then(serde_json::Value::as_str)
-            == Some("join")
-            && content.get("join_authorised_via_users_server").is_some()
-            && let Ok(target) = UserId::parse(&state_key)
-            && room::get_member(room_id, &target, None)
-                .await
-                .is_ok_and(|member| member.membership == MembershipState::Join)
-        {
-            // Profile updates do not need a restricted-join authorizer. Remove
-            // the client-supplied value before hashing/signing: remote servers
-            // validate this field even when event auth would otherwise ignore it.
-            content
-                .as_object_mut()
-                .unwrap()
-                .remove("join_authorised_via_users_server");
+        if strip_redundant_join_authoriser(room_id, &state_key, &mut content).await {
             json = RawJson::from_value(&content)?;
         }
     }
@@ -67,6 +51,39 @@ pub async fn send_state_event_for_key(
     .pdu;
 
     Ok(pdu.event_id)
+}
+
+/// Remove `join_authorised_via_users_server` from an `m.room.member` join whose
+/// target is already joined. Profile updates do not need a restricted-join
+/// authorizer, and remote servers validate this field even when event auth would
+/// otherwise ignore it, so it must go before hashing/signing. Callers must hold
+/// the room state lock so the membership read matches what the event is built on.
+/// Returns whether the content changed.
+pub(crate) async fn strip_redundant_join_authoriser(
+    room_id: &RoomId,
+    state_key: &str,
+    content: &mut serde_json::Value,
+) -> bool {
+    if content
+        .get("membership")
+        .and_then(serde_json::Value::as_str)
+        != Some("join")
+        || content.get("join_authorised_via_users_server").is_none()
+    {
+        return false;
+    }
+    let Ok(target) = UserId::parse(state_key) else {
+        return false;
+    };
+    if !room::get_member(room_id, &target, None)
+        .await
+        .is_ok_and(|member| member.membership == MembershipState::Join)
+    {
+        return false;
+    }
+    content
+        .as_object_mut()
+        .is_some_and(|object| object.remove("join_authorised_via_users_server").is_some())
 }
 
 pub(crate) async fn allowed_to_send_state_event(
