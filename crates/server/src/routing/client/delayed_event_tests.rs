@@ -197,4 +197,54 @@ async fn delayed_sticky_body() {
         "org.matrix.msc4354.sticky_duration_ms":60000}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["errcode"], "M_INVALID_PARAM");
+    spec_delay_query_schedules_instead_of_sending(&service, &room, base).await;
+}
+
+/// Element Call's delayed leave: `PUT /state/...?org.matrix.msc4140.delay=` must not
+/// apply the state at once (it used to wipe the caller's own call membership).
+async fn spec_delay_query_schedules_instead_of_sending(
+    service: &Service,
+    room: &OwnedRoomId,
+    base: &str,
+) {
+    let v3 = "http://localhost/_matrix/client/v3";
+    let state_url = format!("{v3}/rooms/{room}/state/org.matrix.msc3401.call.member/_owner_D");
+    let joined = ok(
+        service,
+        TestClient::put(&state_url).json(&json!({"application":"m.call"})),
+    )
+    .await;
+    assert!(joined["event_id"].is_string());
+    let delayed = ok(
+        service,
+        TestClient::put(format!("{state_url}?org.matrix.msc4140.delay=60000")).json(&json!({})),
+    )
+    .await;
+    let delay_id = delayed["delay_id"].as_str().unwrap();
+    assert!(delayed.get("event_id").is_none());
+    let current = ok(service, TestClient::get(&state_url)).await;
+    assert_eq!(
+        current["application"], "m.call",
+        "delayed leave applied immediately"
+    );
+    ok(
+        service,
+        TestClient::post(format!("{base}/delayed_events/{delay_id}/send")),
+    )
+    .await;
+    assert_eq!(ok(service, TestClient::get(&state_url)).await, json!({}));
+    let send_url =
+        format!("{v3}/rooms/{room}/send/m.room.message/spec-delay?org.matrix.msc4140.delay=60000");
+    let body = json!({"msgtype":"m.text","body":"later"});
+    let scheduled = ok(service, TestClient::put(&send_url).json(&body)).await;
+    assert_eq!(
+        ok(service, TestClient::put(&send_url).json(&body)).await,
+        scheduled
+    );
+    let (status, _) = send(
+        service,
+        TestClient::put(format!("{state_url}?org.matrix.msc4140.delay=0")).json(&json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

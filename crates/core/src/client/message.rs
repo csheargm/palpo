@@ -161,6 +161,16 @@ pub struct CreateMessageWithTxnReqArgs {
     #[serde(skip_serializing_if = "Option::is_none", rename = "ts")]
     pub timestamp: Option<UnixMillis>,
 
+    /// MSC4140: when present, schedule the event to be sent after this many
+    /// milliseconds instead of sending it now; the response carries a `delay_id`.
+    #[salvo(parameter(parameter_in = Query))]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "org.matrix.msc4140.delay"
+    )]
+    pub delay_ms: Option<u64>,
+
     /// The duration for which the event should receive sticky delivery guarantees.
     #[cfg(feature = "unstable-msc4354")]
     #[salvo(parameter(parameter_in = Query))]

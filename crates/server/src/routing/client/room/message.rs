@@ -4,6 +4,7 @@ use diesel::prelude::*;
 use horme::RunQueryDsl;
 use serde_json::value::to_raw_value;
 
+use crate::core::client::delayed_events::SentOrDelayedResBody;
 use crate::core::client::message::{
     CreateMessageReqArgs, CreateMessageWithTxnReqArgs, MessagesReqArgs, MessagesResBody,
     SendMessageResBody,
@@ -305,7 +306,7 @@ pub(super) async fn send_message(
     args: CreateMessageWithTxnReqArgs,
     req: &mut Request,
     depot: &mut Depot,
-) -> JsonResult<SendMessageResBody> {
+) -> JsonResult<SentOrDelayedResBody> {
     let authed = depot.authed_info()?;
 
     let conf = config::get();
@@ -318,6 +319,21 @@ pub(super) async fn send_message(
 
     let payload = req.payload().await?;
     let content = parse_event_content(payload)?;
+    if let Some(delay_ms) = args.delay_ms {
+        let delay_id = super::super::delayed_event::schedule_from_query(
+            authed,
+            &args.room_id,
+            args.event_type.to_string().into(),
+            Some(&args.txn_id),
+            args.timestamp,
+            args.sticky_duration_ms,
+            delay_ms,
+            None,
+            content,
+        )
+        .await?;
+        return json_ok(SentOrDelayedResBody::Delayed { delay_id });
+    }
 
     let state_lock = room::lock_state(&args.room_id).await;
     // Check if this is a new transaction id
@@ -331,7 +347,7 @@ pub(super) async fn send_message(
     )
     .await?
     {
-        return json_ok(SendMessageResBody::new(event_id));
+        return json_ok(SentOrDelayedResBody::Sent { event_id });
     }
 
     let mut unsigned = BTreeMap::new();
@@ -370,7 +386,9 @@ pub(super) async fn send_message(
     )
     .await?;
 
-    json_ok(SendMessageResBody::new((*event_id).to_owned()))
+    json_ok(SentOrDelayedResBody::Sent {
+        event_id: (*event_id).to_owned(),
+    })
 }
 
 /// #POST /_matrix/client/r0/rooms/{room_id}/send/{event_type}

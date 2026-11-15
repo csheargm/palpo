@@ -4,11 +4,11 @@ use salvo::oapi::extract::*;
 use salvo::prelude::*;
 use serde_json::json;
 
+use crate::core::client::delayed_events::SentOrDelayedResBody;
 use crate::core::client::room::ReportContentReqBody;
 use crate::core::client::state::{
-    SendStateEventReqArgs, SendStateEventReqBody, SendStateEventResBody, StateEventFormat,
-    StateEventsForEmptyKeyReqArgs, StateEventsForKeyReqArgs, StateEventsForKeyResBody,
-    StateEventsResBody,
+    SendStateEventReqArgs, SendStateEventReqBody, StateEventFormat, StateEventsForEmptyKeyReqArgs,
+    StateEventsForKeyReqArgs, StateEventsForKeyResBody, StateEventsResBody,
 };
 use crate::core::client::typing::{CreateTypingEventReqBody, Typing};
 use crate::core::events::StateEventType;
@@ -280,11 +280,26 @@ pub(super) async fn send_state_for_key(
     args: SendStateEventReqArgs,
     body: JsonBody<SendStateEventReqBody>,
     depot: &mut Depot,
-) -> JsonResult<SendStateEventResBody> {
+) -> JsonResult<SentOrDelayedResBody> {
     let authed = depot.authed_info()?;
     let body = body.into_inner();
     let state_key = args.state_key.clone().unwrap_or_default();
 
+    if let Some(delay_ms) = args.delay_ms {
+        let delay_id = super::super::delayed_event::schedule_from_query(
+            authed,
+            &args.room_id,
+            args.event_type.to_string().into(),
+            None,
+            args.timestamp,
+            args.sticky_duration_ms,
+            delay_ms,
+            Some(state_key),
+            serde_json::from_str(body.0.inner().get())?,
+        )
+        .await?;
+        return json_ok(SentOrDelayedResBody::Delayed { delay_id });
+    }
     let event_id = crate::state::send_state_event_for_key(
         authed.user_id(),
         &args.room_id,
@@ -297,7 +312,9 @@ pub(super) async fn send_state_for_key(
     )
     .await?;
 
-    json_ok(SendStateEventResBody::new((*event_id).to_owned()))
+    json_ok(SentOrDelayedResBody::Sent {
+        event_id: (*event_id).to_owned(),
+    })
 }
 
 /// #PUT /_matrix/client/r0/rooms/{room_id}/state/{event_type}
@@ -312,9 +329,24 @@ pub(super) async fn send_state_for_empty_key(
     args: SendStateEventReqArgs,
     body: JsonBody<SendStateEventReqBody>,
     depot: &mut Depot,
-) -> JsonResult<SendStateEventResBody> {
+) -> JsonResult<SentOrDelayedResBody> {
     let authed = depot.authed_info()?;
     let body = body.into_inner();
+    if let Some(delay_ms) = args.delay_ms {
+        let delay_id = super::super::delayed_event::schedule_from_query(
+            authed,
+            &args.room_id,
+            args.event_type.to_string().into(),
+            None,
+            args.timestamp,
+            args.sticky_duration_ms,
+            delay_ms,
+            Some(String::new()),
+            serde_json::from_str(body.0.inner().get())?,
+        )
+        .await?;
+        return json_ok(SentOrDelayedResBody::Delayed { delay_id });
+    }
     let event_id = crate::state::send_state_event_for_key(
         authed.user_id(),
         &args.room_id,
@@ -327,7 +359,9 @@ pub(super) async fn send_state_for_empty_key(
     )
     .await?;
 
-    json_ok(SendStateEventResBody::new((*event_id).to_owned()))
+    json_ok(SentOrDelayedResBody::Sent {
+        event_id: (*event_id).to_owned(),
+    })
 }
 
 fn appservice_timestamp(

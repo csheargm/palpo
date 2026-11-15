@@ -82,6 +82,39 @@ async fn update_delayed_event(
     empty_ok()
 }
 
+/// MSC4140's spec form: `PUT /send` or `PUT /state` with `?org.matrix.msc4140.delay=<ms>`
+/// schedules the event through the same machinery, limits and `[delayed_events]`
+/// switch as `send_delayed_event`, instead of sending it at once.
+/// `txn_id` is `None` for state, whose route has no transaction ID; a fresh one is used.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn schedule_from_query(
+    authed: &crate::AuthedInfo,
+    room_id: &crate::core::RoomId,
+    event_type: crate::core::events::TimelineEventType,
+    txn_id: Option<&crate::core::TransactionId>,
+    timestamp: Option<crate::core::UnixMillis>,
+    sticky_duration_ms: Option<crate::core::events::sticky::StickyDurationMs>,
+    delay_ms: u64,
+    state_key: Option<String>,
+    content: serde_json::Value,
+) -> AppResult<String> {
+    let fresh = crate::core::TransactionId::new();
+    crate::delayed_event::schedule(
+        authed.user_id(),
+        authed.device_id(),
+        authed.appservice().is_some(),
+        room_id,
+        &event_type,
+        txn_id.unwrap_or(&fresh),
+        timestamp,
+        sticky_duration_ms,
+        std::time::Duration::from_millis(delay_ms),
+        state_key,
+        content,
+    )
+    .await
+}
+
 /// Retain the historical query form while rejecting ambiguous requests.
 fn sticky_duration(
     body: Option<crate::core::events::sticky::StickyDurationMs>,

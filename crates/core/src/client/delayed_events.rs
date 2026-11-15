@@ -458,3 +458,56 @@ mod tests {
         );
     }
 }
+
+/// Response of `PUT /send` and `PUT /state`: an event ID when sent at once, or
+/// a `delay_id` when MSC4140's `org.matrix.msc4140.delay` query scheduled it.
+#[derive(ToSchema, Serialize, Debug)]
+#[serde(untagged)]
+pub enum SentOrDelayedResBody {
+    /// The event was sent now.
+    Sent {
+        /// The ID of the sent event.
+        event_id: OwnedEventId,
+    },
+    /// The event was scheduled as a delayed event.
+    Delayed {
+        /// The ID used to restart, send or cancel the delayed event.
+        delay_id: String,
+    },
+}
+
+#[cfg(test)]
+mod delay_query_tests {
+    use super::SentOrDelayedResBody;
+    use crate::client::message::CreateMessageWithTxnReqArgs;
+    use crate::client::state::SendStateEventReqArgs;
+
+    #[test]
+    fn state_and_send_parse_the_msc4140_delay_query() {
+        let state =
+            "room_id=%21r%3Aexample.org&event_type=org.matrix.msc3401.call.member&state_key=k";
+        let args: SendStateEventReqArgs = serde_html_form::from_str(state).unwrap();
+        assert_eq!(args.delay_ms, None);
+        let args: SendStateEventReqArgs =
+            serde_html_form::from_str(&format!("{state}&org.matrix.msc4140.delay=8000")).unwrap();
+        assert_eq!(args.delay_ms, Some(8000));
+        assert!(
+            serde_html_form::from_str::<SendStateEventReqArgs>(&format!(
+                "{state}&org.matrix.msc4140.delay=-1"
+            ))
+            .is_err()
+        );
+        let send = "room_id=%21r%3Aexample.org&event_type=m.room.message&txn_id=t\
+                    &org.matrix.msc4140.delay=5";
+        let args: CreateMessageWithTxnReqArgs = serde_html_form::from_str(send).unwrap();
+        assert_eq!(args.delay_ms, Some(5));
+    }
+
+    #[test]
+    fn delayed_response_carries_only_delay_id() {
+        let body = serde_json::to_value(SentOrDelayedResBody::Delayed {
+            delay_id: "d".into(),
+        });
+        assert_eq!(body.unwrap(), serde_json::json!({"delay_id": "d"}));
+    }
+}
