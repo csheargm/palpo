@@ -328,6 +328,9 @@ pub(super) async fn send_message(
     );
     // Both modes check the other mode's record under the room lock, so a txn_id
     // cannot be committed once as delayed and once as immediate.
+    // TODO(multi-instance): lock_state is process-local; two server processes can
+    // still race a delayed and an immediate request for one txn_id. Closing that
+    // needs a shared DB record/constraint covering both modes.
     let state_lock = room::lock_state(&args.room_id).await;
     if let Some(delay_ms) = args.delay_ms {
         if crate::data::room::transaction_id::get_scoped_event_id(

@@ -387,7 +387,7 @@ pub async fn schedule(
     sticky_duration_ms: Option<crate::core::events::sticky::StickyDurationMs>,
     delay: Duration,
     state_key: Option<String>,
-    mut content: JsonValue,
+    content: JsonValue,
 ) -> AppResult<String> {
     let conf = config::get();
     let now = UnixMillis::now().get() as i64;
@@ -449,15 +449,18 @@ pub async fn schedule(
     }
     if let Some(state_key) = &state_key {
         let state_event_type: StateEventType = event_type.to_string().into();
+        // Check a normalized copy but store the original: the target may leave
+        // before firing, and then the authorizer is needed again. Fire time
+        // normalizes under the room lock.
+        let mut checked = content.clone();
         if state_event_type == StateEventType::RoomMember {
-            // Schedule-time view only; fire time normalizes again under the lock.
-            crate::state::strip_redundant_join_authoriser(room_id, state_key, &mut content).await;
+            crate::state::strip_redundant_join_authoriser(room_id, state_key, &mut checked).await;
         }
         crate::state::allowed_to_send_state_event(
             room_id,
             &state_event_type,
             state_key,
-            &serde_json::from_value(content.clone())?,
+            &serde_json::from_value(checked)?,
         )
         .await?;
     }

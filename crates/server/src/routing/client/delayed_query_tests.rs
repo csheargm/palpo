@@ -1,7 +1,5 @@
 //! HTTP/PostgreSQL coverage for the MSC4140 `?org.matrix.msc4140.delay=` form of
 //! `PUT /send` and `PUT /state`. Driven from `delayed_sticky_body` (one shared DB).
-use diesel::prelude::*;
-use horme::RunQueryDsl;
 use salvo::prelude::*;
 use salvo::test::TestClient;
 use serde_json::{Value, json};
@@ -122,15 +120,13 @@ pub(super) async fn delayed_send_txn_scope_and_mode(
 }
 
 /// A joined user's delayed member update carrying `join_authorised_via_users_server`
-/// is accepted and sent without it, matching immediate `/state`; the strip also
-/// runs at fire time, when membership may differ from schedule time.
+/// is accepted, stored unchanged, and stripped at fire time like immediate `/state`.
 pub(super) async fn delayed_member_strips_redundant_authoriser(
     service: &Service,
     room: &OwnedRoomId,
     base: &str,
     user: &UserId,
 ) {
-    use crate::data::schema::delayed_events;
     let url = format!("{V3}/rooms/{room}/state/m.room.member/{user}");
     let content = json!({"membership":"join","displayname":"later",
         "join_authorised_via_users_server":user});
@@ -144,17 +140,8 @@ pub(super) async fn delayed_member_strips_redundant_authoriser(
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        row.content
-            .get("join_authorised_via_users_server")
-            .is_none()
-    );
-    // Simulate a row stored before the target joined: only fire time can strip it.
-    diesel::update(delayed_events::table.filter(delayed_events::delay_id.eq(delay_id)))
-        .set(delayed_events::content.eq(&content))
-        .execute(&mut data::connect())
-        .await
-        .unwrap();
+    // Stored as sent: the target may leave before firing and need the authorizer.
+    assert_eq!(row.content, content);
     ok(
         service,
         TestClient::post(format!("{base}/delayed_events/{delay_id}/send")),
