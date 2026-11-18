@@ -15,6 +15,7 @@
 //! those on its own profile. Server-internal writes do not pass through here.
 use crate::core::identifiers::UserId;
 use crate::core::serde::JsonValue;
+use crate::exts::IsRemoteOrLocal;
 use crate::{AppResult, MatrixError, data};
 
 /// Custom profile fields under this prefix are reserved to the appservice.
@@ -72,11 +73,17 @@ pub(super) async fn check(
     if !field.starts_with(RESERVED_PREFIX) {
         return Ok(ReservedWrite::Apply);
     }
+    if user_id.is_remote() {
+        return Err(MatrixError::forbidden("This profile field is managed by the server.", None).into());
+    }
     let owning_appservice = authed
         .appservice()
         .is_some_and(|appservice| appservice.is_exclusive_user_match(user_id));
+    // A puppet is an account an appservice created inside an exclusive
+    // namespace, not merely a matching MXID (an older account could match).
     let own_puppet = authed.appservice().is_none()
         && authed.user_id() == user_id
+        && authed.user().appservice_id.is_some()
         && crate::appservice::is_exclusive_user_id(user_id).await?;
     let writer = Writer {
         owning_appservice,
