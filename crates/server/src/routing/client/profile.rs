@@ -19,6 +19,11 @@ use crate::core::user::ProfileResBody;
 use crate::data::user::DbProfile;
 use crate::exts::*;
 use crate::room::timeline;
+// TODO(R4): profile.rs is over budget; split the custom-field handlers
+// (get/set/delete_profile_field) into profile_fields.rs.
+#[path = "profile_reserved.rs"]
+mod reserved;
+
 use crate::{
     AppError, AuthArgs, EmptyResult, JsonResult, MatrixError, PduBuilder, data, empty_ok, hoops,
     json_ok, room,
@@ -549,6 +554,9 @@ async fn set_profile_field(
         .fields
         .remove(&field)
         .ok_or_else(|| MatrixError::bad_json("Profile field body does not match path field."))?;
+    if reserved::check(authed, &user_id, &field, Some(&value)).await? == reserved::ReservedWrite::AlreadySet {
+        return empty_ok();
+    }
 
     data::user::set_profile_field(&user_id, &field, value).await?;
 
@@ -570,6 +578,7 @@ async fn delete_profile_field(
 
     let authed = depot.authed_info()?;
     ensure_profile_update_allowed(authed, &user_id)?;
+    reserved::check(authed, &user_id, &field, None).await?;
 
     data::user::delete_profile_field(&user_id, &field).await?;
 
