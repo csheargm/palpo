@@ -1,5 +1,4 @@
-use std::borrow::Borrow;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, RunQueryDsl};
@@ -344,23 +343,15 @@ pub async fn append_pdu(
         }
     }
 
-    let mut leaves: BTreeSet<_> = state::get_forward_extremities(&pdu.room_id)
-        .await?
-        .into_iter()
-        .collect();
-    // Remove any forward extremities that are referenced by this incoming event's prev_events
-    leaves.retain(|event_id| !pdu.prev_events.contains(event_id));
-    if !diesel_exists!(
+    // Only add the event as a forward extremity if no stored event cites it yet.
+    let becomes_tip = !diesel_exists!(
         event_edges::table.filter(event_edges::prev_id.eq(&pdu.event_id)),
         &mut connect().await?
-    )? {
-        // Only add the incoming event as a forward extremity if it is not already in the DB
-        leaves.insert(pdu.event_id.clone());
-    }
-    // The leaves are written in the publication transaction below, not here. If this
-    // append stops early (an error, or the client dropping its request), the event stays
-    // an unreferenced outlier. Writing them now let the room's next event cite an
-    // outlier that was never published or sent, which no other server could fetch.
+    )?;
+    // The tips move in the publication transaction below, not here. If this append
+    // stops early (an error, or the client dropping its request), the event stays an
+    // unreferenced outlier. Moving them here let the room's next event cite an outlier
+    // that was never published or sent, which no other server could fetch.
     state::update_backward_extremities(pdu).await?;
 
     #[derive(Deserialize, Clone, Debug)]
@@ -628,8 +619,7 @@ pub async fn append_pdu(
         .transaction::<_, AppError, _>(async |conn| {
             event_data.save_with_conn(conn).await?;
             crate::event::sticky::publish_live_frame_with_conn(conn, pdu, frame_id).await?;
-            let leaves = leaves.iter().map(Borrow::borrow).collect::<Vec<_>>();
-            state::set_forward_extremities_with_conn(conn, &pdu.room_id, &leaves, state_lock)
+            state::advance_forward_extremities_with_conn(conn, pdu, becomes_tip, state_lock)
                 .await?;
             Ok(())
         })

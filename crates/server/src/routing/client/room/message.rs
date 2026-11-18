@@ -324,33 +324,19 @@ pub(super) async fn send_message(
     let timestamp = appservice_timestamp(authed.appservice().is_some(), args.timestamp);
     let event_id = run_detached(async move {
         let state_lock = room::lock_state(&args.room_id).await;
-        // Check if this is a new transaction id
         let endpoint = format!("room/send/{}", args.event_type);
-        if let Some(event_id) = crate::data::room::transaction_id::get_scoped_event_id(
-            &args.txn_id,
-            &user_id,
-            device_id.as_deref(),
-            Some(&args.room_id),
-            &endpoint,
-        )
-        .await?
-        {
-            return Ok(event_id);
-        }
-
         let mut unsigned = BTreeMap::new();
         unsigned.insert(
             "transaction_id".to_owned(),
             to_raw_value(&args.txn_id).expect("TxnId is valid json"),
         );
-
-        let event_id = timeline::build_and_append_pdu(
+        // The transaction receipt is looked up and recorded inside the append fence,
+        // and a published event whose receipt was lost is recovered on retry.
+        let event_id = timeline::build_and_append_pdu_with_transaction(
             PduBuilder {
                 event_type: args.event_type.to_string().into(),
                 content: to_raw_value(&content)?,
                 unsigned,
-                transaction_device: device_id.clone(),
-                transaction_endpoint: Some(endpoint.clone()),
                 timestamp,
                 sticky_duration_ms: args.sticky_duration_ms,
                 ..Default::default()
@@ -359,20 +345,11 @@ pub(super) async fn send_message(
             &args.room_id,
             &crate::room::get_version(&args.room_id).await?,
             &state_lock,
+            Some((&endpoint, &args.txn_id, device_id.as_deref())),
         )
         .await?
         .pdu
         .event_id;
-
-        crate::data::room::transaction_id::add_scoped_txn_id(
-            &args.txn_id,
-            &user_id,
-            device_id.as_deref(),
-            Some(&args.room_id),
-            Some(&event_id),
-            &endpoint,
-        )
-        .await?;
         Ok((*event_id).to_owned())
     })
     .await?;

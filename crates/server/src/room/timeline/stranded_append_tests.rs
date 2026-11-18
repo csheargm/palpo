@@ -205,13 +205,64 @@ async fn stranded_append() {
         room::state::frame_after_only_prev(&orphan).await.unwrap(),
         None
     );
+    // A remote server's outlier carries no local auth verdict, and a prev from another
+    // room says nothing about this room's state: both stay hidden.
+    let mut remote_sent = stranded.clone();
+    remote_sent.pdu.sender = UserId::parse(format!("@mallory:{REMOTE}")).unwrap();
+    assert_eq!(
+        room::state::frame_after_only_prev(&remote_sent)
+            .await
+            .unwrap(),
+        None
+    );
+    let other = request(
+        TestClient::post("http://localhost/_matrix/client/v3/createRoom")
+            .add_header("Authorization", "Bearer alice", true)
+            .json(&json!({"room_version": "11", "preset": "public_chat"})),
+        &service,
+    )
+    .await;
+    let other: OwnedRoomId = other["room_id"].as_str().unwrap().try_into().unwrap();
+    let mut wrong_room = stranded.clone();
+    wrong_room.pdu.prev_events = extremities(&other)
+        .await
+        .into_iter()
+        .map(|id| EventId::parse(id).unwrap())
+        .collect();
+    assert_eq!(
+        room::state::frame_after_only_prev(&wrong_room)
+            .await
+            .unwrap(),
+        None
+    );
+    // The fallback only supplies state; the room's history visibility still decides.
+    request(
+        TestClient::put(format!(
+            "http://localhost/_matrix/client/v3/rooms/{room}/state/m.room.history_visibility/"
+        ))
+        .add_header("Authorization", "Bearer alice", true)
+        .json(&json!({"history_visibility": "joined"})),
+        &service,
+    )
+    .await;
+    let (private, _) = local_outlier(&alice, &room, "members only").await;
+    assert!(
+        !room::state::server_can_see_event(&remote, &room, &private.event_id)
+            .await
+            .unwrap(),
+        "a frameless outlier leaked past joined history visibility"
+    );
 
     // 4. A client that drops its send request mid-append must not cut the append off.
-    //    Hold the room's cross-process append fence so the send is parked inside the
-    //    append, drop the request, then release the fence: the send still finishes.
-    let mut fence = data::connect().await.unwrap();
-    fence.batch_execute("BEGIN").await.unwrap();
-    crate::data::room::timeline::lock_event_append(&mut fence, &room)
+    //    Lock the room's current tip so the send parks inside its publication
+    //    transaction, after its outlier is saved. Drop the request there, then release
+    //    the lock: the send still finishes.
+    let tip = extremities(&room).await;
+    let mut blocker = data::connect().await.unwrap();
+    blocker
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM event_forward_extremities WHERE room_id = '{room}' FOR UPDATE"
+        ))
         .await
         .unwrap();
     let dropped = TestClient::put(format!(
@@ -221,12 +272,24 @@ async fn stranded_append() {
     .json(&json!({"msgtype":"m.text","body":"client went away"}))
     .send(service.router());
     assert!(
-        tokio::time::timeout(Duration::from_millis(300), dropped)
+        tokio::time::timeout(Duration::from_millis(800), dropped)
             .await
             .is_err(),
-        "the send was expected to wait for the held append fence"
+        "the send was expected to wait on the locked tip"
     );
-    fence.batch_execute("ROLLBACK").await.unwrap();
+    let saved_outlier = diesel::sql_query(
+        "SELECT e.id FROM events e JOIN event_datas d ON d.event_id = e.id \
+         WHERE e.is_outlier AND d.json_data->'content'->>'body' = 'client went away'",
+    )
+    .execute(&mut data::connect().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(
+        saved_outlier, 1,
+        "the dropped send had not reached publication"
+    );
+    assert_eq!(extremities(&room).await, tip);
+    blocker.batch_execute("ROLLBACK").await.unwrap();
     let txn: crate::core::OwnedTransactionId = "dropped-send".into();
     let device = OwnedDeviceId::from("D");
     let mut finished = None;
