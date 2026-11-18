@@ -29,6 +29,8 @@ pub(crate) mod publication;
 pub mod stream;
 pub mod topolo;
 pub use backfill::*;
+#[cfg(test)]
+mod stranded_append_tests;
 
 // In-memory caches removed for cluster support.
 // All timeline counts are queried from the database directly.
@@ -355,8 +357,10 @@ pub async fn append_pdu(
         // Only add the incoming event as a forward extremity if it is not already in the DB
         leaves.insert(pdu.event_id.clone());
     }
-    state::set_forward_extremities(&pdu.room_id, leaves.iter().map(Borrow::borrow), state_lock)
-        .await?;
+    // The leaves are written in the publication transaction below, not here. If this
+    // append stops early (an error, or the client dropping its request), the event stays
+    // an unreferenced outlier. Writing them now let the room's next event cite an
+    // outlier that was never published or sent, which no other server could fetch.
     state::update_backward_extremities(pdu).await?;
 
     #[derive(Deserialize, Clone, Debug)]
@@ -624,6 +628,9 @@ pub async fn append_pdu(
         .transaction::<_, AppError, _>(async |conn| {
             event_data.save_with_conn(conn).await?;
             crate::event::sticky::publish_live_frame_with_conn(conn, pdu, frame_id).await?;
+            let leaves = leaves.iter().map(Borrow::borrow).collect::<Vec<_>>();
+            state::set_forward_extremities_with_conn(conn, &pdu.room_id, &leaves, state_lock)
+                .await?;
             Ok(())
         })
         .await?;

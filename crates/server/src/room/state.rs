@@ -481,27 +481,38 @@ pub async fn get_forward_extremities(room_id: &RoomId) -> AppResult<Vec<OwnedEve
 pub async fn set_forward_extremities<'a, I>(
     room_id: &RoomId,
     event_ids: I,
-    _lock: &RoomMutexGuard,
+    lock: &RoomMutexGuard,
 ) -> AppResult<()>
 where
     I: Iterator<Item = &'a EventId> + Send + 'a,
 {
     let event_ids = event_ids.collect::<Vec<_>>();
+    set_forward_extremities_with_conn(&mut *connect().await?, room_id, &event_ids, lock).await
+}
+
+/// Replace a room's forward extremities on the caller's connection, so a live append
+/// can make its event a DAG tip in the same transaction that publishes it.
+pub(crate) async fn set_forward_extremities_with_conn(
+    conn: &mut AsyncPgConnection,
+    room_id: &RoomId,
+    event_ids: &[&EventId],
+    _lock: &RoomMutexGuard,
+) -> AppResult<()> {
     diesel::delete(
         event_forward_extremities::table
             .filter(event_forward_extremities::room_id.eq(room_id))
-            .filter(event_forward_extremities::event_id.ne_all(&event_ids)),
+            .filter(event_forward_extremities::event_id.ne_all(event_ids)),
     )
-    .execute(&mut connect().await?)
+    .execute(conn)
     .await?;
     for event_id in event_ids {
         diesel::insert_into(event_forward_extremities::table)
             .values((
                 event_forward_extremities::room_id.eq(room_id),
-                event_forward_extremities::event_id.eq(event_id),
+                event_forward_extremities::event_id.eq(*event_id),
             ))
             .on_conflict_do_nothing()
-            .execute(&mut connect().await?)
+            .execute(conn)
             .await?;
     }
     Ok(())
@@ -1076,11 +1087,17 @@ pub async fn server_can_see_event(
         Err(e) if e.is_not_found() && pdu.state_key.is_none() => {
             match get_pdu_frame_id(event_id).await {
                 Ok(frame_id) => frame_id,
-                Err(e) if e.is_not_found() => return Ok(false),
+                Err(e) if e.is_not_found() => match frame_after_only_prev(&pdu).await? {
+                    Some(frame_id) => frame_id,
+                    None => return Ok(false),
+                },
                 Err(e) => return Err(e),
             }
         }
-        Err(e) if e.is_not_found() => return Ok(false),
+        Err(e) if e.is_not_found() => match frame_after_only_prev(&pdu).await? {
+            Some(frame_id) => frame_id,
+            None => return Ok(false),
+        },
         Err(e) => return Err(e),
     };
     let StateBefore::Resolved(history_visibility) =
@@ -1138,6 +1155,25 @@ pub async fn server_can_see_event(
     }
 
     Ok(visible)
+}
+
+/// The state before an event that has no frame of its own (an outlier), when it can be
+/// known without state resolution: with exactly one prev event, the state before the
+/// event is the state after that prev. Other servers need this to fetch an outlier that
+/// later events cite (a local append that stopped before publication left such events).
+/// A rejected event, or one with several prevs, stays unknown.
+pub(crate) async fn frame_after_only_prev(pdu: &SnPduEvent) -> AppResult<Option<i64>> {
+    let [prev_id] = pdu.prev_events.as_slice() else {
+        return Ok(None);
+    };
+    if pdu.rejection_reason.is_some() {
+        return Ok(None);
+    }
+    match get_pdu_frame_id(prev_id).await {
+        Ok(frame_id) => Ok(Some(frame_id)),
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[tracing::instrument(skip(origin, user_id))]

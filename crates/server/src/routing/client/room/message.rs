@@ -319,58 +319,65 @@ pub(super) async fn send_message(
     let payload = req.payload().await?;
     let content = parse_event_content(payload)?;
 
-    let state_lock = room::lock_state(&args.room_id).await;
-    // Check if this is a new transaction id
-    let endpoint = format!("room/send/{}", args.event_type);
-    if let Some(event_id) = crate::data::room::transaction_id::get_scoped_event_id(
-        &args.txn_id,
-        authed.user_id(),
-        authed.device_id(),
-        Some(&args.room_id),
-        &endpoint,
-    )
-    .await?
-    {
-        return json_ok(SendMessageResBody::new(event_id));
-    }
+    let user_id = authed.user_id().to_owned();
+    let device_id = authed.device_id().map(ToOwned::to_owned);
+    let timestamp = appservice_timestamp(authed.appservice().is_some(), args.timestamp);
+    let event_id = run_detached(async move {
+        let state_lock = room::lock_state(&args.room_id).await;
+        // Check if this is a new transaction id
+        let endpoint = format!("room/send/{}", args.event_type);
+        if let Some(event_id) = crate::data::room::transaction_id::get_scoped_event_id(
+            &args.txn_id,
+            &user_id,
+            device_id.as_deref(),
+            Some(&args.room_id),
+            &endpoint,
+        )
+        .await?
+        {
+            return Ok(event_id);
+        }
 
-    let mut unsigned = BTreeMap::new();
-    unsigned.insert(
-        "transaction_id".to_owned(),
-        to_raw_value(&args.txn_id).expect("TxnId is valid json"),
-    );
+        let mut unsigned = BTreeMap::new();
+        unsigned.insert(
+            "transaction_id".to_owned(),
+            to_raw_value(&args.txn_id).expect("TxnId is valid json"),
+        );
 
-    let event_id = timeline::build_and_append_pdu(
-        PduBuilder {
-            event_type: args.event_type.to_string().into(),
-            content: to_raw_value(&content)?,
-            unsigned,
-            transaction_device: authed.device_id().map(ToOwned::to_owned),
-            transaction_endpoint: Some(endpoint.clone()),
-            timestamp: appservice_timestamp(authed.appservice().is_some(), args.timestamp),
-            sticky_duration_ms: args.sticky_duration_ms,
-            ..Default::default()
-        },
-        authed.user_id(),
-        &args.room_id,
-        &crate::room::get_version(&args.room_id).await?,
-        &state_lock,
-    )
-    .await?
-    .pdu
-    .event_id;
+        let event_id = timeline::build_and_append_pdu(
+            PduBuilder {
+                event_type: args.event_type.to_string().into(),
+                content: to_raw_value(&content)?,
+                unsigned,
+                transaction_device: device_id.clone(),
+                transaction_endpoint: Some(endpoint.clone()),
+                timestamp,
+                sticky_duration_ms: args.sticky_duration_ms,
+                ..Default::default()
+            },
+            &user_id,
+            &args.room_id,
+            &crate::room::get_version(&args.room_id).await?,
+            &state_lock,
+        )
+        .await?
+        .pdu
+        .event_id;
 
-    crate::data::room::transaction_id::add_scoped_txn_id(
-        &args.txn_id,
-        authed.user_id(),
-        authed.device_id(),
-        Some(&args.room_id),
-        Some(&event_id),
-        &endpoint,
-    )
+        crate::data::room::transaction_id::add_scoped_txn_id(
+            &args.txn_id,
+            &user_id,
+            device_id.as_deref(),
+            Some(&args.room_id),
+            Some(&event_id),
+            &endpoint,
+        )
+        .await?;
+        Ok((*event_id).to_owned())
+    })
     .await?;
 
-    json_ok(SendMessageResBody::new((*event_id).to_owned()))
+    json_ok(SendMessageResBody::new(event_id))
 }
 
 /// #POST /_matrix/client/r0/rooms/{room_id}/send/{event_type}
@@ -399,26 +406,50 @@ pub(super) async fn post_message(
     let payload = req.payload().await?;
     let content = parse_event_content(payload)?;
 
-    let state_lock = room::lock_state(&args.room_id).await;
-    let event_id = timeline::build_and_append_pdu(
-        PduBuilder {
-            event_type: args.event_type.to_string().into(),
-            content: to_raw_value(&content)?,
-            unsigned: BTreeMap::new(),
-            timestamp: appservice_timestamp(authed.appservice().is_some(), args.timestamp),
-            sticky_duration_ms: args.sticky_duration_ms,
-            ..Default::default()
-        },
-        authed.user_id(),
-        &args.room_id,
-        &crate::room::get_version(&args.room_id).await?,
-        &state_lock,
-    )
-    .await?
-    .pdu
-    .event_id;
+    let user_id = authed.user_id().to_owned();
+    let timestamp = appservice_timestamp(authed.appservice().is_some(), args.timestamp);
+    let event_id = run_detached(async move {
+        let state_lock = room::lock_state(&args.room_id).await;
+        let event_id = timeline::build_and_append_pdu(
+            PduBuilder {
+                event_type: args.event_type.to_string().into(),
+                content: to_raw_value(&content)?,
+                unsigned: BTreeMap::new(),
+                timestamp,
+                sticky_duration_ms: args.sticky_duration_ms,
+                ..Default::default()
+            },
+            &user_id,
+            &args.room_id,
+            &crate::room::get_version(&args.room_id).await?,
+            &state_lock,
+        )
+        .await?
+        .pdu
+        .event_id;
+        Ok((*event_id).to_owned())
+    })
+    .await?;
 
-    json_ok(SendMessageResBody::new((*event_id).to_owned()))
+    json_ok(SendMessageResBody::new(event_id))
+}
+
+/// Run the room side of a client send on its own task. A local append spans several
+/// database writes and the federation enqueue; when the client drops the request,
+/// salvo drops the handler future, and an append cut off halfway used to leave its
+/// event an unpublished outlier that later events still cited. A spawned task runs to
+/// completion, so a retry with the same transaction id finds the finished event.
+/// TODO(split seam: routing/client/room/send.rs): state PUT and redact still append on
+/// the request future; the extremity write now waits for publication, so a cut-off
+/// append there no longer strands a cited outlier, but its tail can still be skipped.
+async fn run_detached<T, F>(work: F) -> AppResult<T>
+where
+    F: Future<Output = AppResult<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(work)
+        .await
+        .map_err(|e| AppError::internal(format!("room send task did not finish: {e}")))?
 }
 
 #[cfg(test)]
