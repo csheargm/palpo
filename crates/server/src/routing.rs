@@ -191,6 +191,8 @@ pub async fn limit_rate() -> AppResult<()> {
     Ok(())
 }
 
+// TODO(R4): routing.rs is over the 300-line budget; split the well-known
+// handlers (client/server/support) into routing/well_known.rs.
 #[endpoint]
 fn well_known_client(res: &mut Response) -> JsonResult<ClientResBody> {
     res.headers_mut().insert(
@@ -202,6 +204,7 @@ fn well_known_client(res: &mut Response) -> JsonResult<ClientResBody> {
     let mut body = ClientResBody::new(HomeServerInfo {
         base_url: client_url.clone(),
     });
+    body.rtc_foci = conf.well_known.rtc_foci.clone();
 
     // Advertise OIDC issuer (MSC3861) — prefer delegated_auth, fall back to oidc.mas_issuer
     if let Some(da) = conf.enabled_delegated_auth() {

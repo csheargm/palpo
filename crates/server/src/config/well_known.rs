@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use url::Url;
 
+use crate::core::client::discovery::client::RtcFocusInfo;
 use crate::core::client::discovery::support::ContactRole;
 use crate::core::{OwnedServerName, OwnedUserId};
 use crate::macros::config_example;
@@ -93,4 +94,59 @@ pub struct WellKnownConfig {
     ///
     /// Example: "https://example.com/security.asc"
     pub support_pgp_key: Option<String>,
+
+    /// MatrixRTC foci advertised in `/.well-known/matrix/client` (MSC4143), ordered
+    /// by priority. Element Call and other MatrixRTC clients read this to find the
+    /// LiveKit JWT service (e.g. lk-jwt-service) used for voice/video calls.
+    ///
+    /// Leave empty (the default) to advertise no foci.
+    ///
+    /// Example:
+    ///
+    /// ```toml
+    /// [[well_known.rtc_foci]]
+    /// type = "livekit"
+    /// livekit_service_url = "https://livekit-jwt.example.com"
+    /// ```
+    #[serde(default)]
+    pub rtc_foci: Vec<RtcFocusInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtc_foci_defaults_to_empty() {
+        let conf: WellKnownConfig = toml::from_str("").unwrap();
+        assert!(conf.rtc_foci.is_empty());
+    }
+
+    #[test]
+    fn rtc_foci_parses_livekit_focus() {
+        let conf: WellKnownConfig = toml::from_str(
+            r#"
+            [[rtc_foci]]
+            type = "livekit"
+            livekit_service_url = "http://127.0.0.1:8071"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            conf.rtc_foci,
+            vec![RtcFocusInfo::livekit("http://127.0.0.1:8071".to_owned())]
+        );
+    }
+
+    #[test]
+    fn rtc_foci_serialize_under_msc4143_key() {
+        use crate::core::client::discovery::client::{ClientResBody, HomeServerInfo};
+        let mut body = ClientResBody::new(HomeServerInfo::new("http://hs".to_owned()));
+        body.rtc_foci = vec![RtcFocusInfo::livekit("http://jwt".to_owned())];
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json["org.matrix.msc4143.rtc_foci"],
+            serde_json::json!([{"type": "livekit", "livekit_service_url": "http://jwt"}])
+        );
+    }
 }

@@ -112,6 +112,24 @@ pub async fn publish_expired_typings(now_ms: i64) -> DataResult<Vec<OwnedRoomId>
     .map_err(Into::into)
 }
 
+/// Pull every live typing deadline later than `max_timeout_at` back to it,
+/// bumping `occur_sn` so sync republishes the list. Rows written before the
+/// federated-timeout unit fix sat hours in the future and kept "X is typing"
+/// up long after an upgrade. Returns the affected rooms (with repeats).
+pub async fn clamp_typing_deadlines(max_timeout_at: i64) -> DataResult<Vec<OwnedRoomId>> {
+    diesel::update(room_typings::table.filter(room_typings::timeout_at.gt(max_timeout_at)))
+        .set((
+            room_typings::timeout_at.eq(max_timeout_at),
+            room_typings::occur_sn.eq(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+                "nextval('occur_sn_seq')",
+            )),
+        ))
+        .returning(room_typings::room_id)
+        .get_results::<OwnedRoomId>(&mut connect().await?)
+        .await
+        .map_err(Into::into)
+}
+
 /// Sequence number of the most recent typing update in a room (0 if none).
 pub async fn last_typing_sn(room_id: &RoomId) -> DataResult<Seqnum> {
     let sn = room_typings::table

@@ -159,6 +159,8 @@ async fn login(
                 .map_err(|_| MatrixError::invalid_username("Username is invalid."))?;
 
             if let Some(da) = config::get().enabled_delegated_auth() {
+                let typed = typed_login_localpart(identifier);
+                let user_id = resolve_delegated_login_user_id(&user_id, &typed).await?;
                 let device_id = body
                     .device_id
                     .clone()
@@ -411,6 +413,52 @@ fn ensure_appservice_can_login_as(
             "User is not in appservice's namespace",
             None,
         ))
+    }
+}
+
+/// The localpart exactly as typed, before the login path lowercases it.
+fn typed_login_localpart(identifier: &UserIdentifier) -> String {
+    let UserIdentifier::Matrix(user) = identifier else {
+        return String::new();
+    };
+    let raw = user.user.strip_prefix('@').unwrap_or(&user.user);
+    raw.split(':').next().unwrap_or_default().to_owned()
+}
+
+/// The login path lowercases the requested localpart, but a delegated provider
+/// may have provisioned a mixed-case one ("@Betty"). Use the stored id so the
+/// provider sees the account it created and the user row lookup matches.
+async fn resolve_delegated_login_user_id(
+    requested: &UserId,
+    typed_localpart: &str,
+) -> AppResult<OwnedUserId> {
+    let candidates =
+        data::user::local_user_ids_ignoring_case(requested.localpart(), requested.server_name())
+            .await?;
+    pick_login_user_id(requested, typed_localpart, &candidates).ok_or_else(|| {
+        MatrixError::forbidden(
+            "Several accounts differ only by letter case; type the username exactly.",
+            None,
+        )
+        .into()
+    })
+}
+
+/// The typed spelling wins, then the lowercased request, then a single case
+/// variant. Several variants with no exact match are refused, never guessed.
+fn pick_login_user_id(
+    requested: &UserId,
+    typed_localpart: &str,
+    candidates: &[OwnedUserId],
+) -> Option<OwnedUserId> {
+    let exact = |localpart: &str| candidates.iter().find(|id| id.localpart() == localpart);
+    if let Some(id) = exact(typed_localpart).or_else(|| exact(requested.localpart())) {
+        return Some(id.clone());
+    }
+    match candidates {
+        [] => Some(requested.to_owned()),
+        [only] => Some(only.clone()),
+        _ => None,
     }
 }
 
@@ -1083,6 +1131,48 @@ mod tests {
     fn default_oidc_provider_errors_without_providers() {
         let oidc = config::OidcConfig::default();
         assert!(default_oidc_provider(&oidc).is_err());
+    }
+
+    fn uid(raw: &str) -> OwnedUserId {
+        UserId::parse(raw).expect("test user id")
+    }
+
+    #[test]
+    fn delegated_login_maps_lowercased_request_to_stored_mixed_case_user() {
+        let stored = vec![uid("@Betty:example.com")];
+        let picked = pick_login_user_id(&uid("@betty:example.com"), "betty", &stored);
+        assert_eq!(picked, Some(stored[0].clone()));
+    }
+
+    #[test]
+    fn delegated_login_honours_typed_case_when_both_variants_exist() {
+        let stored = vec![uid("@Betty:example.com"), uid("@betty:example.com")];
+        let requested = uid("@betty:example.com");
+        assert_eq!(pick_login_user_id(&requested, "Betty", &stored), Some(stored[0].clone()));
+        assert_eq!(pick_login_user_id(&requested, "betty", &stored), Some(stored[1].clone()));
+    }
+
+    #[test]
+    fn delegated_login_refuses_ambiguous_case_variants() {
+        let stored = vec![uid("@Betty:example.com"), uid("@BETTY:example.com")];
+        assert_eq!(pick_login_user_id(&uid("@betty:example.com"), "betty", &stored), None);
+    }
+
+    #[test]
+    fn delegated_login_keeps_request_for_unknown_user() {
+        let requested = uid("@nobody:example.com");
+        assert_eq!(pick_login_user_id(&requested, "nobody", &[]), Some(requested));
+    }
+
+    #[test]
+    fn typed_login_localpart_keeps_case_and_strips_server() {
+        let typed = |user: &str| {
+            typed_login_localpart(&UserIdentifier::Matrix(
+                crate::core::client::uiaa::MatrixUserIdentifier::new(user.to_owned()),
+            ))
+        };
+        assert_eq!(typed("Betty"), "Betty");
+        assert_eq!(typed("@Betty:localhost:8452"), "Betty");
     }
 
     #[test]

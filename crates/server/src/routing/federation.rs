@@ -28,6 +28,10 @@ pub fn router() -> Router {
         .oapi_tag("federation")
         // Server discovery is public; authentication applies only to the other routes.
         .push(Router::with_path("v1/version").get(version))
+        // OpenID userinfo authenticates by the OpenID token in its query string
+        // (spec: no auth). Behind the access-token hoop that token was treated as
+        // a client access token and every lookup failed with M_UNKNOWN_TOKEN.
+        .push(Router::with_path("v1").push(openid::router()))
         .push(authenticated_router())
 }
 
@@ -39,7 +43,6 @@ fn authenticated_router() -> Router {
                 .push(backfill::router())
                 .push(event::router())
                 .push(membership::router_v2())
-                .push(openid::router())
                 .push(query::router())
                 .push(room::router())
                 .push(space::router())
@@ -52,7 +55,6 @@ fn authenticated_router() -> Router {
                 .push(backfill::router())
                 .push(event::router())
                 .push(membership::router_v1())
-                .push(openid::router())
                 .push(query::router())
                 .push(room::router())
                 .push(space::router())
@@ -169,5 +171,17 @@ mod tests {
                 "M_MISSING_TOKEN"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn openid_userinfo_is_not_behind_access_token_auth() {
+        let service = service();
+        let response = TestClient::get("http://localhost/_matrix/federation/v1/openid/userinfo")
+            .send(&service)
+            .await;
+        // Reaching the handler without the hoop, a missing query token is a
+        // 400 from argument parsing. 404/500 (route gone or broken) and 401
+        // (access-token hoop back in front) all fail this assertion.
+        assert_eq!(response.status_code, Some(StatusCode::BAD_REQUEST));
     }
 }

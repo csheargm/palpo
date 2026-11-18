@@ -766,6 +766,28 @@ pub async fn get_user(user_id: &UserId) -> DataResult<DbUser> {
         .map_err(Into::into)
 }
 
+/// Local user ids whose localpart equals `localpart` ignoring ASCII case.
+///
+/// Delegated auth providers may keep a mixed-case localpart ("Betty") that the
+/// Matrix login path lowercases; callers use this to find the stored id.
+// TODO(R4): user.rs is over budget; split account lookups into user/lookup.rs.
+pub async fn local_user_ids_ignoring_case(
+    localpart: &str,
+    server_name: &ServerName,
+) -> DataResult<Vec<OwnedUserId>> {
+    let ids = users::table
+        .filter(users::localpart.ilike(escape_like_pattern(localpart)))
+        .filter(users::server_name.eq(server_name.as_str()))
+        .filter(users::is_local.eq(true))
+        .select(users::id)
+        .load::<OwnedUserId>(&mut connect().await?)
+        .await?;
+    Ok(ids
+        .into_iter()
+        .filter(|id| id.localpart().eq_ignore_ascii_case(localpart))
+        .collect())
+}
+
 /// Insert a user, updating the existing row if one already exists.
 pub async fn create_user(new_user: &NewDbUser) -> DataResult<DbUser> {
     diesel::insert_into(users::table)
