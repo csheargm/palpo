@@ -289,7 +289,23 @@ async fn stranded_append() {
         "the dropped send had not reached publication"
     );
     assert_eq!(extremities(&room).await, tip);
+    // The client retries the same transaction while the first attempt is still
+    // parked. The retry must answer with that attempt's event, not append another.
+    let retry_router = service.router();
+    let retry_room = room.clone();
+    let retry = tokio::spawn(async move {
+        let mut response = TestClient::put(format!(
+            "http://localhost/_matrix/client/v3/rooms/{retry_room}/send/m.room.message/dropped-send"
+        ))
+        .add_header("Authorization", "Bearer alice", true)
+        .json(&json!({"msgtype":"m.text","body":"client went away"}))
+        .send(retry_router)
+        .await;
+        response.take_json::<Value>().await.unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
     blocker.batch_execute("ROLLBACK").await.unwrap();
+    let retried = retry.await.unwrap();
     let txn: crate::core::OwnedTransactionId = "dropped-send".into();
     let device = OwnedDeviceId::from("D");
     let mut finished = None;
@@ -314,4 +330,17 @@ async fn stranded_append() {
         "the dropped send left an outlier"
     );
     assert_eq!(extremities(&room).await, vec![finished.to_string()]);
+    assert_eq!(
+        retried["event_id"].as_str(),
+        Some(finished.as_str()),
+        "the retry did not return the first attempt's event: {retried}"
+    );
+    let copies = diesel::sql_query(
+        "SELECT e.id FROM events e JOIN event_datas d ON d.event_id = e.id \
+         WHERE d.json_data->'content'->>'body' = 'client went away'",
+    )
+    .execute(&mut data::connect().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(copies, 1, "the same transaction was appended twice");
 }
